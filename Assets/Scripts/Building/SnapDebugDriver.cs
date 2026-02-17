@@ -1,4 +1,3 @@
-// Assets/Scripts/Building/SnapDebugDriver.cs
 using UnityEngine;
 
 public sealed class SnapDebugDriver : MonoBehaviour
@@ -27,7 +26,7 @@ public sealed class SnapDebugDriver : MonoBehaviour
         if (_snapSystem == null || _previewPart == null || _desiredPoint == null)
             return;
 
-        var result = _snapSystem.FindBestSnap(_previewPart, _desiredPoint.position);
+        var result = _snapSystem.FindBestSnap(_previewPart, _desiredPoint.position, null, default);
 
         if (_logWhenValidChanges && result.IsValid != _lastValid)
         {
@@ -38,8 +37,6 @@ public sealed class SnapDebugDriver : MonoBehaviour
         if (!_applySnapToPreview)
             return;
 
-        // If snapping is valid, move preview to snapped position.
-        // Otherwise, just follow the desired point.
         _previewPart.transform.position = result.IsValid
             ? result.SnappedWorldPosition
             : _desiredPoint.position;

@@ -1,38 +1,57 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
+using System;
 
-public class PlacementPreview : MonoBehaviour
+public sealed class PlacementPreview : MonoBehaviour
 {
+    public event Action<Part> PartPlaced;
+
     [Header("Scene References")]
     [SerializeField] private Camera _camera;
     [SerializeField] private SnapSystem _snapSystem;
 
-    [Header("Raycast Settings")]
-    [SerializeField] private LayerMask _groundLayer;
+    [Header("Surface Raycast")]
+    [Tooltip("Layers the mouse can hit for placement: Ground + Parts.")]
+    [SerializeField] private LayerMask _surfaceLayer;
+
     [SerializeField] private float _maxRayDistance = 200f;
+    [SerializeField] private bool _requireSnapForPlacement = true;
+
+    [Header("Preview Rotation")]
+    [SerializeField, Min(1f)] private float _rotationStepDegrees = 15f;
+    [SerializeField] private Key _rotateLeftKey = Key.Z;
+    [SerializeField] private Key _rotateRightKey = Key.X;
 
     [Header("Placement Validation")]
-    [Tooltip("Layer that contains already-placed parts (their colliders).")]
+    [Tooltip("Layer containing placed parts colliders. Must NOT include Ground.")]
     [SerializeField] private LayerMask _partLayer;
 
-    [Tooltip("Small extra margin for overlap checks. Helps avoid 'almost touching' false placements.")]
-    [SerializeField] private float _overlapPadding = 0.01f;
+    [Tooltip("Shrink overlap bounds to allow touching. Start: 0.01")]
+    [SerializeField] private float _overlapShrink = 0.01f;
 
-    [Header("Input (V0)")]
-    [Tooltip("Left click places, right click cancels.")]
+    [Header("Joint Stability")]
+    [SerializeField] private bool _autoConfigureConnectedAnchor = false;
+    [SerializeField] private bool _enablePreprocessing = false;
+    [SerializeField] private bool _enableCollisionBetweenConnectedBodies = false;
+    [SerializeField] private float _jointBreakForce = Mathf.Infinity;
+    [SerializeField] private float _jointBreakTorque = Mathf.Infinity;
+    [SerializeField, Min(0.01f)] private float _jointMassScale = 1f;
+    [SerializeField, Min(0.01f)] private float _jointConnectedMassScale = 1f;
+    [SerializeField] private bool _autoConnectAdditionalNodes = true;
+    [SerializeField] private bool _debugBuildFlow = true;
 
-
+    // Runtime
+    private GameObject _activePreviewPrefab;
     private Part _currentPreviewPart;
+    private Collider[] _previewColliders;
     private SnapSystem.SnapResult _lastSnap;
     private bool _isPlacementValid;
+    private bool _isCancellingPreview;
+    private float _previewYawDegrees;
 
-    // Reused buffer to avoid allocations each frame during overlap checks
     private readonly Collider[] _overlapBuffer = new Collider[64];
 
-    /// <summary>
-    /// Call this from UI (button) or from a BuildManager when the player chooses a part.
-    /// </summary>
-    public void BeginPreview(Part partPrefab)
+    public void BeginPreview(GameObject partPrefab)
     {
         if (partPrefab == null)
         {
@@ -40,204 +59,343 @@ public class PlacementPreview : MonoBehaviour
             return;
         }
 
-        CancelPreview(); // remove any previous preview
+        if (_debugBuildFlow)
+            Debug.Log($"[PlacementPreview] BeginPreview -> {partPrefab.name}", this);
 
-        // Instantiate preview part
-        _currentPreviewPart = Instantiate(partPrefab);
+        bool isSamePrefabSelection = _activePreviewPrefab == partPrefab;
+        _activePreviewPrefab = partPrefab;
+        if (!isSamePrefabSelection)
+            _previewYawDegrees = 0f;
 
-        // Put the preview into "safe to move" mode (your Part.cs already does this)
-        _currentPreviewPart.InitializeForPlacement();
+        CancelPreview();
+        bool spawned = TrySpawnPreview(partPrefab);
 
-        // Reset snap and validity state
-        _lastSnap = default;
-        _isPlacementValid = false;
+        if (_debugBuildFlow)
+            Debug.Log($"[PlacementPreview] BeginPreview spawned={spawned}", this);
     }
 
-    /// <summary>
-    /// Cancels preview and clears state.
-    /// </summary>
+    private bool TrySpawnPreview(GameObject partPrefab)
+    {
+        if (_debugBuildFlow)
+            Debug.Log($"[PlacementPreview] TrySpawnPreview -> {partPrefab.name}", this);
+
+        GameObject go = Instantiate(partPrefab);
+
+        _currentPreviewPart = go.GetComponent<Part>();
+        if (_currentPreviewPart == null)
+        {
+            Debug.LogError("[PlacementPreview] Prefab has no Part component on root. Add Part to the prefab root.", go);
+            Destroy(go);
+            return false;
+        }
+        _currentPreviewPart.SetRuntimePrefabKey(partPrefab.name);
+
+        _currentPreviewPart.InitializeForPlacement();
+        _previewColliders = _currentPreviewPart.GetComponentsInChildren<Collider>(includeInactive: false);
+        _currentPreviewPart.transform.rotation = Quaternion.Euler(0f, _previewYawDegrees, 0f);
+
+        _lastSnap = default;
+        _isPlacementValid = false;
+
+        if (_debugBuildFlow)
+            Debug.Log($"[PlacementPreview] Preview ready: {_currentPreviewPart.name}", this);
+
+        return true;
+    }
+
     public void CancelPreview()
     {
+        if (_isCancellingPreview) return;
+        _isCancellingPreview = true;
+
         if (_currentPreviewPart != null)
         {
-            Destroy(_currentPreviewPart.gameObject);
+            if (_debugBuildFlow)
+                Debug.Log($"[PlacementPreview] CancelPreview destroying {_currentPreviewPart.name}", this);
+
+            GameObject previewGo = _currentPreviewPart.gameObject;
             _currentPreviewPart = null;
+
+            if (previewGo != null)
+                Destroy(previewGo);
         }
 
+        _previewColliders = null;
         _lastSnap = default;
         _isPlacementValid = false;
+        _isCancellingPreview = false;
     }
-    
+
     private void Update()
     {
-        if (Mouse.current == null)
-            return;
-        // If we are not currently previewing anything, do nothing.
-        if (_currentPreviewPart == null)
-            return;
+        if (_currentPreviewPart == null) return;
+        if (Mouse.current == null) return;
 
-        // Right click cancels preview.
         if (Mouse.current.rightButton.wasPressedThisFrame)
         {
             CancelPreview();
             return;
         }
 
-        // 1) Get desired placement point from mouse raycast
-        if (!TryGetMouseWorldPoint(out Vector3 desiredPoint))
-            return; // mouse not hitting ground
+        ApplyRotationInput();
+        _currentPreviewPart.transform.rotation = Quaternion.Euler(0f, _previewYawDegrees, 0f);
 
-        // 2) Ask SnapSystem if we can snap near this desired point
-        _lastSnap = _snapSystem != null
-            ? _snapSystem.FindBestSnap(_currentPreviewPart, desiredPoint)
+        if (!TryGetMouseSurfaceHit(out RaycastHit hit))
+        {
+            _isPlacementValid = false;
+            return;
+        }
+
+        // Desired point is the surface point the mouse is on (prevents “behind” placement)
+        Vector3 desiredPoint = hit.point;
+
+        // If the mouse is hitting a part, prefer snapping to THAT part face
+        Part hitPart = hit.collider != null ? hit.collider.GetComponentInParent<Part>() : null;
+        Vector3 hitNormal = hit.normal;
+
+        _lastSnap = (_snapSystem != null)
+            ? _snapSystem.FindBestSnap(_currentPreviewPart, desiredPoint, hitPart, hitNormal)
             : default;
 
-        // 3) Move preview part: snapped position if valid, otherwise follow desired point
         Vector3 targetPos = _lastSnap.IsValid ? _lastSnap.SnappedWorldPosition : desiredPoint;
         _currentPreviewPart.transform.position = targetPos;
 
-        // 4) Validate placement (prevents part-inside-part)
         _isPlacementValid = CheckPlacementValid(_currentPreviewPart);
+        if (_requireSnapForPlacement && !_lastSnap.IsValid)
+            _isPlacementValid = false;
 
-        // 5) Place on left click (only if valid)
         if (Mouse.current.leftButton.wasPressedThisFrame && _isPlacementValid)
         {
             PlaceCurrent();
         }
     }
 
-    
-    /// <summary>
-    /// Raycast from mouse cursor to ground to get world point.
-    /// This is how we know where the player "wants" the part.
-    /// </summary>
-    private bool TryGetMouseWorldPoint(out Vector3 worldPoint)
+    private bool TryGetMouseSurfaceHit(out RaycastHit hit)
     {
-        worldPoint = default;
-
-        if (_camera == null)
-        {
-            Debug.LogError("[PlacementPreview] No camera assigned.", this);
-            return false;
-        }
+        hit = default;
+        if (_camera == null) return false;
 
         Vector2 mousePos = Mouse.current.position.ReadValue();
         Ray ray = _camera.ScreenPointToRay(mousePos);
 
-        if (Physics.Raycast(ray, out RaycastHit hit, _maxRayDistance, _groundLayer, QueryTriggerInteraction.Ignore))
-        {
-            worldPoint = hit.point;
-            return true;
-        }
-
-        return false;
+        return Physics.Raycast(ray, out hit, _maxRayDistance, _surfaceLayer, QueryTriggerInteraction.Ignore);
     }
-    
-    /// <summary>
-    /// Returns false if the preview overlaps any collider on the part layer
-    /// that does NOT belong to the preview itself.
-    /// </summary>
+
     private bool CheckPlacementValid(Part previewPart)
     {
-        if (previewPart == null) return false;
-
-        // Collect all colliders on the preview part
-        Collider[] previewColliders = previewPart.GetComponentsInChildren<Collider>(includeInactive: false);
-        if (previewColliders == null || previewColliders.Length == 0)
+        Collider[] previewColliders = _previewColliders;
+        if (previewColliders == null || previewColliders.Length == 0 || !HasLiveCollider(previewColliders))
         {
-            // If the part has no colliders, we can't validate properly.
-            // For V0: consider this invalid to avoid weird placements.
-            return false;
+            previewColliders = previewPart.GetComponentsInChildren<Collider>(includeInactive: false);
+            _previewColliders = previewColliders;
         }
+
+        if (previewColliders == null || previewColliders.Length == 0) return false;
 
         for (int i = 0; i < previewColliders.Length; i++)
         {
             Collider c = previewColliders[i];
             if (c == null) continue;
 
-            // We do an overlap query using the collider's bounds.
-            // This is not perfect geometry-accurate, but it's robust for V0.
             Bounds b = c.bounds;
 
-            Vector3 center = b.center;
-            Vector3 halfExtents = b.extents + Vector3.one * _overlapPadding;
+            Vector3 halfExtents = b.extents - Vector3.one * _overlapShrink;
+            halfExtents = Vector3.Max(halfExtents, Vector3.zero);
 
-            int hitCount = Physics.OverlapBoxNonAlloc(
-                center,
+            int count = Physics.OverlapBoxNonAlloc(
+                b.center,
                 halfExtents,
                 _overlapBuffer,
-                Quaternion.identity,  // bounds are axis-aligned in world space
+                Quaternion.identity,
                 _partLayer,
                 QueryTriggerInteraction.Ignore
             );
 
-            for (int h = 0; h < hitCount; h++)
+            for (int k = 0; k < count; k++)
             {
-                Collider hit = _overlapBuffer[h];
-                if (hit == null) continue;
+                Collider other = _overlapBuffer[k];
+                if (other == null) continue;
 
-                // Ignore collisions with our own preview colliders
-                if (hit.transform.IsChildOf(previewPart.transform))
-                    continue;
+                // ignore our own colliders
+                if (other.transform.IsChildOf(previewPart.transform)) continue;
 
-                // We found overlap with some other placed part collider => invalid placement
                 return false;
             }
         }
 
         return true;
     }
-    /// <summary>
-    /// Finalize the preview into a real physics part and connect joint if snapped.
-    /// </summary>
+
+    private static bool HasLiveCollider(Collider[] colliders)
+    {
+        for (int i = 0; i < colliders.Length; i++)
+        {
+            if (colliders[i] != null) return true;
+        }
+
+        return false;
+    }
+
+    private void ApplyRotationInput()
+    {
+        if (Keyboard.current == null) return;
+
+        if (Keyboard.current[_rotateLeftKey].wasPressedThisFrame)
+            _previewYawDegrees -= _rotationStepDegrees;
+
+        if (Keyboard.current[_rotateRightKey].wasPressedThisFrame)
+            _previewYawDegrees += _rotationStepDegrees;
+    }
+
     private void PlaceCurrent()
     {
         if (_currentPreviewPart == null)
-            return;
-
-        // Convert preview -> real physics object
-        _currentPreviewPart.FinalizePlacement();
-
-        // If we have a valid snap, create a FixedJoint
-        if (_lastSnap.IsValid && _lastSnap.PreviewNode != null && _lastSnap.TargetNode != null)
         {
-            Rigidbody previewRb = _lastSnap.PreviewNode.Owner != null ? _lastSnap.PreviewNode.Owner.GetRigidbody() : null;
-            Rigidbody targetRb  = _lastSnap.TargetNode.Owner  != null ? _lastSnap.TargetNode.Owner.GetRigidbody()  : null;
-
-            if (previewRb != null && targetRb != null)
-            {
-                // Create joint on preview part, connect to target part
-                FixedJoint joint = previewRb.gameObject.AddComponent<FixedJoint>();
-                joint.connectedBody = targetRb;
-
-                // Optional: you can tune these later for stability
-                // joint.breakForce = Mathf.Infinity;
-                // joint.breakTorque = Mathf.Infinity;
-                // joint.enableCollision = false;
-
-                // Mark nodes as connected (updates occupancy + pairing)
-                _lastSnap.PreviewNode.MarkConnected(_lastSnap.TargetNode);
-            }
-            else
-            {
-                Debug.LogWarning("[PlacementPreview] Snap valid but missing rigidbodies for joint creation.", this);
-            }
+            if (_debugBuildFlow)
+                Debug.LogWarning("[PlacementPreview] PlaceCurrent called with null _currentPreviewPart.", this);
+            return;
         }
 
-        // For V0: stop preview after placing once
+        GameObject placedPrefab = _activePreviewPrefab;
+
+        if (_debugBuildFlow)
+        {
+            string prefabName = placedPrefab != null ? placedPrefab.name : "NULL";
+            Debug.Log($"[PlacementPreview] PlaceCurrent placed={_currentPreviewPart.name} nextPrefab={prefabName}", this);
+        }
+
+        // Build phase: place as finalized but still kinematic until simulation starts.
+        _currentPreviewPart.FinalizePlacement(enableSimulation: false);
+
+        Part placedPart = _currentPreviewPart;
+
+        if (_lastSnap.IsValid && _lastSnap.PreviewNode != null && _lastSnap.TargetNode != null)
+        {
+            TryCreateNodeJoint(_lastSnap.PreviewNode, _lastSnap.TargetNode);
+        }
+
+        if (_autoConnectAdditionalNodes && _currentPreviewPart != null)
+        {
+            AutoConnectRemainingNodes(_currentPreviewPart);
+        }
+
+        if (placedPart != null)
+            PartPlaced?.Invoke(placedPart);
+
+        // V0: stop after one placement
         _currentPreviewPart = null;
         _lastSnap = default;
         _isPlacementValid = false;
+
+        if (placedPrefab != null)
+        {
+            bool spawned = TrySpawnPreview(placedPrefab);
+            if (_debugBuildFlow)
+                Debug.Log($"[PlacementPreview] Continuous spawn result={spawned}", this);
+        }
+        else if (_debugBuildFlow)
+        {
+            Debug.LogWarning("[PlacementPreview] Continuous spawn skipped: _activePreviewPrefab is null.", this);
+        }
     }
 
-    // Optional: quick debug so you can see validity while playing.
-    // You can remove this later.
     private void OnGUI()
     {
         if (_currentPreviewPart == null) return;
-
-        string text = _isPlacementValid ? "PLACEMENT: VALID" : "PLACEMENT: INVALID";
-        GUI.Label(new Rect(10, 10, 300, 30), text);
+        GUI.Label(new Rect(10, 10, 300, 30), _isPlacementValid ? "PLACEMENT: VALID" : "PLACEMENT: INVALID");
     }
 
+    private bool TryCreateNodeJoint(ConnectionNode previewNode, ConnectionNode targetNode)
+    {
+        if (previewNode == null || targetNode == null) return false;
+        if (!previewNode.CanConnectTo(targetNode)) return false;
+
+        Rigidbody a = previewNode.Owner != null ? previewNode.Owner.GetRigidbody() : null;
+        Rigidbody b = targetNode.Owner != null ? targetNode.Owner.GetRigidbody() : null;
+        if (a == null || b == null) return false;
+
+        FixedJoint joint = a.gameObject.AddComponent<FixedJoint>();
+        joint.connectedBody = b;
+
+        Vector3 previewNodeWorld = previewNode.GetWorldPosition();
+        Vector3 targetNodeWorld = targetNode.GetWorldPosition();
+
+        // Define both anchors explicitly to reduce initial solver error.
+        joint.autoConfigureConnectedAnchor = _autoConfigureConnectedAnchor;
+        joint.anchor = a.transform.InverseTransformPoint(previewNodeWorld);
+        if (!_autoConfigureConnectedAnchor)
+        {
+            joint.connectedAnchor = b.transform.InverseTransformPoint(targetNodeWorld);
+        }
+
+        joint.enablePreprocessing = _enablePreprocessing;
+        joint.enableCollision = _enableCollisionBetweenConnectedBodies;
+        joint.breakForce = _jointBreakForce;
+        joint.breakTorque = _jointBreakTorque;
+        joint.massScale = _jointMassScale;
+        joint.connectedMassScale = _jointConnectedMassScale;
+
+        previewNode.MarkConnected(targetNode);
+        return true;
+    }
+
+    private void AutoConnectRemainingNodes(Part placedPart)
+    {
+        float secondarySnapRadius = (_snapSystem != null && _snapSystem.SnapRadius > 0f)
+            ? _snapSystem.SnapRadius
+            : 0.5f;
+
+        var nodes = placedPart.GetNodes();
+        if (nodes == null || nodes.Count == 0) return;
+
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            ConnectionNode previewNode = nodes[i];
+            if (previewNode == null || previewNode.IsOccupied) continue;
+
+            int hitCount = Physics.OverlapSphereNonAlloc(
+                previewNode.GetWorldPosition(),
+                secondarySnapRadius,
+                _overlapBuffer,
+                _partLayer,
+                QueryTriggerInteraction.Ignore
+            );
+
+            ConnectionNode bestTarget = null;
+            float bestDistance = float.PositiveInfinity;
+
+            for (int h = 0; h < hitCount; h++)
+            {
+                Collider col = _overlapBuffer[h];
+                if (col == null) continue;
+
+                Part targetPart = col.GetComponentInParent<Part>();
+                if (targetPart == null || targetPart == placedPart) continue;
+
+                var targetNodes = targetPart.GetNodes();
+                if (targetNodes == null || targetNodes.Count == 0) continue;
+
+                for (int t = 0; t < targetNodes.Count; t++)
+                {
+                    ConnectionNode targetNode = targetNodes[t];
+                    if (targetNode == null) continue;
+                    if (!previewNode.CanConnectTo(targetNode)) continue;
+
+                    float d = Vector3.Distance(previewNode.GetWorldPosition(), targetNode.GetWorldPosition());
+                    if (d > secondarySnapRadius) continue;
+
+                    if (d < bestDistance)
+                    {
+                        bestDistance = d;
+                        bestTarget = targetNode;
+                    }
+                }
+            }
+
+            if (bestTarget != null)
+            {
+                TryCreateNodeJoint(previewNode, bestTarget);
+            }
+        }
+    }
 }
