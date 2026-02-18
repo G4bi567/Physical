@@ -3,9 +3,12 @@ using System.Collections.Generic;
 
 public sealed class Part : MonoBehaviour
 {
+    private const float MinMass = 0.01f;
+    private const float MaxMass = 10000f;
+    private const float DefaultMass = 10f;
+
     [Header("Config")]
     [SerializeField] private PartType _partType = PartType.Frame;
-    [SerializeField] private float _mass = 10f;
 
     [Header("Runtime (read-only)")]
     [SerializeField] private Rigidbody _rb;
@@ -14,10 +17,11 @@ public sealed class Part : MonoBehaviour
     [SerializeField] private string _runtimePrefabKey;
 
     private IReadOnlyList<ConnectionNode> _nodes;
+    private WheelCollider[] _wheelColliders;
     private bool _isInitializedForPlacement;
 
     public PartType PartType => _partType;
-    public float Mass => _mass;
+    public float Mass => _rb != null ? _rb.mass : DefaultMass;
     public string RuntimePrefabKey => _runtimePrefabKey;
 
     public IReadOnlyList<ConnectionNode> GetNodes()
@@ -55,7 +59,8 @@ public sealed class Part : MonoBehaviour
             Debug.LogError("[Part] Rigidbody must be on the Part root GameObject.", this);
         }
 
-        ValidateMass();
+        _wheelColliders = GetComponentsInChildren<WheelCollider>(includeInactive: true);
+        ValidateRigidbodyMass();
 
         RefreshNodeCache();
 
@@ -81,6 +86,8 @@ public sealed class Part : MonoBehaviour
                 }
             }
         }
+
+        ValidateNodeKindsForPartType();
     }
 
     public void InitializeForPlacement()
@@ -90,6 +97,7 @@ public sealed class Part : MonoBehaviour
 
         _rb.isKinematic = true;
         _rb.detectCollisions = false;
+        SetWheelCollidersEnabled(false);
         _isFinalized = false;
         _isSimulationEnabled = false;
         _isInitializedForPlacement = true;
@@ -105,7 +113,7 @@ public sealed class Part : MonoBehaviour
         }
 
         _rb.detectCollisions = true;
-        _rb.mass = GetClampedMass();
+        ValidateRigidbodyMass();
         SetSimulationEnabled(enableSimulation);
 
         _isFinalized = true;
@@ -124,6 +132,7 @@ public sealed class Part : MonoBehaviour
 
         _rb.isKinematic = !enabled;
         _rb.detectCollisions = true;
+        SetWheelCollidersEnabled(enabled);
         _isSimulationEnabled = enabled;
     }
 
@@ -134,34 +143,50 @@ public sealed class Part : MonoBehaviour
 
     private void OnValidate()
     {
-        ValidateMass();
+        ValidateRigidbodyMass();
+        ValidateNodeKindsForPartType();
     }
 
-    private void ValidateMass()
+    private void ValidateRigidbodyMass()
     {
-        const float minMass = 0.01f;
-        const float maxMass = 10000f;
+        Rigidbody rb = _rb != null ? _rb : GetComponent<Rigidbody>();
+        if (rb == null) return;
 
-        if (float.IsNaN(_mass) || float.IsInfinity(_mass))
+        _rb = rb;
+
+        if (float.IsNaN(rb.mass) || float.IsInfinity(rb.mass))
         {
-            _mass = 10f;
-            Debug.LogWarning("[Part] Mass was invalid (NaN/Infinity). Reset to 10.", this);
+            rb.mass = DefaultMass;
+            Debug.LogWarning($"[Part] Rigidbody mass was invalid (NaN/Infinity). Reset to {DefaultMass}.", this);
             return;
         }
 
-        if (_mass < minMass || _mass > maxMass)
+        if (rb.mass < MinMass || rb.mass > MaxMass)
         {
-            float clamped = Mathf.Clamp(_mass, minMass, maxMass);
-            Debug.LogWarning($"[Part] Mass {_mass} out of range [{minMass}, {maxMass}]. Clamped to {clamped}.", this);
-            _mass = clamped;
+            float clamped = Mathf.Clamp(rb.mass, MinMass, MaxMass);
+            Debug.LogWarning($"[Part] Rigidbody mass {rb.mass} out of range [{MinMass}, {MaxMass}]. Clamped to {clamped}.", this);
+            rb.mass = clamped;
         }
     }
 
-    private float GetClampedMass()
+    private void ValidateNodeKindsForPartType()
     {
-        const float minMass = 0.01f;
-        const float maxMass = 10000f;
-        return Mathf.Clamp(_mass, minMass, maxMass);
+        var nodes = GetComponentsInChildren<ConnectionNode>(includeInactive: true);
+        if (nodes == null || nodes.Length == 0) return;
+
+        for (int i = 0; i < nodes.Length; i++)
+        {
+            ConnectionNode node = nodes[i];
+            if (node == null) continue;
+
+            if (PartConnectionRules.IsNodeKindAllowedOnPart(_partType, node.Kind)) continue;
+
+            Debug.LogWarning(
+                $"[Part] Node '{node.name}' kind {node.Kind} is unusual for PartType {_partType}. " +
+                "This may block snapping by design.",
+                node
+            );
+        }
     }
 
     private void RefreshNodeCache()
@@ -183,5 +208,21 @@ public sealed class Part : MonoBehaviour
         }
 
         return false;
+    }
+
+    private void SetWheelCollidersEnabled(bool enabled)
+    {
+        if (_wheelColliders == null || _wheelColliders.Length == 0)
+            _wheelColliders = GetComponentsInChildren<WheelCollider>(includeInactive: true);
+
+        if (_wheelColliders == null || _wheelColliders.Length == 0)
+            return;
+
+        for (int i = 0; i < _wheelColliders.Length; i++)
+        {
+            WheelCollider wheelCollider = _wheelColliders[i];
+            if (wheelCollider == null) continue;
+            wheelCollider.enabled = enabled;
+        }
     }
 }

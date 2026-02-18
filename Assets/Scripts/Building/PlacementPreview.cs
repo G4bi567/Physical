@@ -1,33 +1,36 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
-using System;
+using UnityEngine.Serialization;
 
-public sealed class PlacementPreview : MonoBehaviour
+public class PlacementPreview : MonoBehaviour
 {
-    public event Action<Part> PartPlaced;
-
     [Header("Scene References")]
     [SerializeField] private Camera _camera;
     [SerializeField] private SnapSystem _snapSystem;
 
-    [Header("Surface Raycast")]
-    [Tooltip("Layers the mouse can hit for placement: Ground + Parts.")]
+    [Header("Raycast Settings")]
+    [FormerlySerializedAs("_groundLayer")]
     [SerializeField] private LayerMask _surfaceLayer;
-
     [SerializeField] private float _maxRayDistance = 200f;
-    [SerializeField] private bool _requireSnapForPlacement = true;
 
     [Header("Preview Rotation")]
     [SerializeField, Min(1f)] private float _rotationStepDegrees = 15f;
     [SerializeField] private Key _rotateLeftKey = Key.Z;
     [SerializeField] private Key _rotateRightKey = Key.X;
 
+    [Header("Preview Visuals")]
+    [SerializeField] private bool _showSnapIndicator = true;
+    [SerializeField, Min(0.02f)] private float _snapIndicatorScale = 0.08f;
+    [SerializeField] private Color _snapIndicatorColor = new Color(0.2f, 1f, 0.25f, 1f);
+    [SerializeField] private Color _validPreviewColor = new Color(0.65f, 0.9f, 1f, 0.85f);
+    [SerializeField] private Color _invalidPreviewColor = new Color(1f, 0.35f, 0.35f, 0.85f);
+
     [Header("Placement Validation")]
-    [Tooltip("Layer containing placed parts colliders. Must NOT include Ground.")]
+    [Tooltip("Layer that contains already-placed parts (their colliders).")]
     [SerializeField] private LayerMask _partLayer;
 
-    [Tooltip("Shrink overlap bounds to allow touching. Start: 0.01")]
-    [SerializeField] private float _overlapShrink = 0.01f;
+    [Tooltip("Small shrink amount for overlap checks. Allows flush face-to-face placement while still blocking real intersections.")]
+    [SerializeField, Min(0f)] private float _overlapPadding = 0.01f;
 
     [Header("Joint Stability")]
     [SerializeField] private bool _autoConfigureConnectedAnchor = false;
@@ -37,21 +40,44 @@ public sealed class PlacementPreview : MonoBehaviour
     [SerializeField] private float _jointBreakTorque = Mathf.Infinity;
     [SerializeField, Min(0.01f)] private float _jointMassScale = 1f;
     [SerializeField, Min(0.01f)] private float _jointConnectedMassScale = 1f;
-    [SerializeField] private bool _autoConnectAdditionalNodes = true;
-    [SerializeField] private bool _debugBuildFlow = true;
 
-    // Runtime
-    private GameObject _activePreviewPrefab;
+    [Header("Mirror Rules")]
+    [SerializeField] private bool _requireMirrorSnapConnection = true;
+    [SerializeField, Min(0f)] private float _mirrorPlaneDeadZone = 0.02f;
+
     private Part _currentPreviewPart;
-    private Collider[] _previewColliders;
+    private Part _activePreviewPrefab;
     private SnapSystem.SnapResult _lastSnap;
+    private Part _mirrorPreviewPart;
+    private SnapSystem.SnapResult _lastMirrorSnap;
     private bool _isPlacementValid;
-    private bool _isCancellingPreview;
+    private bool _isMirrorPlacementValid;
     private float _previewYawDegrees;
+    private bool _isMirrorModeEnabled;
+    private Transform _mirrorReference;
+    private Renderer[] _previewRenderers;
+    private Renderer[] _mirrorPreviewRenderers;
+    private Transform _snapIndicator;
+    private Renderer _snapIndicatorRenderer;
+    public event System.Action<Part> PartPlaced;
 
+    // Reused buffer to avoid allocations each frame during overlap checks
     private readonly Collider[] _overlapBuffer = new Collider[64];
+    private readonly RaycastHit[] _raycastBuffer = new RaycastHit[32];
+    private MaterialPropertyBlock _previewPropertyBlock;
 
-    public void BeginPreview(GameObject partPrefab)
+    private static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
+    private static readonly int ColorId = Shader.PropertyToID("_Color");
+
+    private void Awake()
+    {
+        _previewPropertyBlock = new MaterialPropertyBlock();
+    }
+
+    /// <summary>
+    /// Call this from UI (button) or from a BuildManager when the player chooses a part.
+    /// </summary>
+    public void BeginPreview(Part partPrefab)
     {
         if (partPrefab == null)
         {
@@ -59,78 +85,136 @@ public sealed class PlacementPreview : MonoBehaviour
             return;
         }
 
-        if (_debugBuildFlow)
-            Debug.Log($"[PlacementPreview] BeginPreview -> {partPrefab.name}", this);
-
-        bool isSamePrefabSelection = _activePreviewPrefab == partPrefab;
+        bool isSamePrefab = _activePreviewPrefab == partPrefab;
         _activePreviewPrefab = partPrefab;
-        if (!isSamePrefabSelection)
+        if (!isSamePrefab)
             _previewYawDegrees = 0f;
 
-        CancelPreview();
-        bool spawned = TrySpawnPreview(partPrefab);
-
-        if (_debugBuildFlow)
-            Debug.Log($"[PlacementPreview] BeginPreview spawned={spawned}", this);
+        CancelPreview(clearActivePrefab: false);
+        TrySpawnPreview(_activePreviewPrefab);
     }
 
-    private bool TrySpawnPreview(GameObject partPrefab)
+    public void SetMirrorMode(bool enabled, Transform mirrorReference)
     {
-        if (_debugBuildFlow)
-            Debug.Log($"[PlacementPreview] TrySpawnPreview -> {partPrefab.name}", this);
+        _isMirrorModeEnabled = enabled;
+        _mirrorReference = mirrorReference;
 
-        GameObject go = Instantiate(partPrefab);
-
-        _currentPreviewPart = go.GetComponent<Part>();
-        if (_currentPreviewPart == null)
+        if (!_isMirrorModeEnabled)
         {
-            Debug.LogError("[PlacementPreview] Prefab has no Part component on root. Add Part to the prefab root.", go);
-            Destroy(go);
-            return false;
+            DestroyMirrorPreview();
+            return;
         }
-        _currentPreviewPart.SetRuntimePrefabKey(partPrefab.name);
 
-        _currentPreviewPart.InitializeForPlacement();
-        _previewColliders = _currentPreviewPart.GetComponentsInChildren<Collider>(includeInactive: false);
-        _currentPreviewPart.transform.rotation = Quaternion.Euler(0f, _previewYawDegrees, 0f);
+        if (_currentPreviewPart != null && _activePreviewPrefab != null)
+        {
+            EnsureMirrorPreviewExists();
+            UpdateMirrorPreviewFromPrimary();
+        }
+    }
 
+    /// <summary>
+    /// Cancels preview and clears state.
+    /// </summary>
+    public void CancelPreview()
+    {
+        CancelPreview(clearActivePrefab: true);
+    }
+
+    private void CancelPreview(bool clearActivePrefab)
+    {
+        if (_currentPreviewPart != null)
+        {
+            Destroy(_currentPreviewPart.gameObject);
+            _currentPreviewPart = null;
+        }
+
+        DestroyMirrorPreview();
+
+        if (clearActivePrefab)
+            _activePreviewPrefab = null;
+
+        _previewRenderers = null;
         _lastSnap = default;
         _isPlacementValid = false;
+        SetSnapIndicatorVisible(false);
+    }
 
-        if (_debugBuildFlow)
-            Debug.Log($"[PlacementPreview] Preview ready: {_currentPreviewPart.name}", this);
+    private bool TrySpawnPreview(Part partPrefab)
+    {
+        if (partPrefab == null)
+            return false;
 
+        _currentPreviewPart = Instantiate(partPrefab);
+        if (_currentPreviewPart == null)
+            return false;
+
+        _currentPreviewPart.InitializeForPlacement();
+        _currentPreviewPart.transform.rotation = Quaternion.Euler(0f, _previewYawDegrees, 0f);
+        _previewRenderers = _currentPreviewPart.GetComponentsInChildren<Renderer>(includeInactive: false);
+        _lastSnap = default;
+        _isPlacementValid = false;
+        ApplyPreviewTint(_invalidPreviewColor);
+
+        if (_isMirrorModeEnabled)
+        {
+            EnsureMirrorPreviewExists();
+            UpdateMirrorPreviewFromPrimary();
+        }
+        else
+        {
+            DestroyMirrorPreview();
+        }
+
+        SetSnapIndicatorVisible(false);
         return true;
     }
 
-    public void CancelPreview()
+    private void EnsureMirrorPreviewExists()
     {
-        if (_isCancellingPreview) return;
-        _isCancellingPreview = true;
-
-        if (_currentPreviewPart != null)
+        if (!_isMirrorModeEnabled || _activePreviewPrefab == null)
         {
-            if (_debugBuildFlow)
-                Debug.Log($"[PlacementPreview] CancelPreview destroying {_currentPreviewPart.name}", this);
-
-            GameObject previewGo = _currentPreviewPart.gameObject;
-            _currentPreviewPart = null;
-
-            if (previewGo != null)
-                Destroy(previewGo);
+            DestroyMirrorPreview();
+            return;
         }
 
-        _previewColliders = null;
-        _lastSnap = default;
-        _isPlacementValid = false;
-        _isCancellingPreview = false;
+        if (_mirrorPreviewPart != null)
+            return;
+
+        _mirrorPreviewPart = Instantiate(_activePreviewPrefab);
+        if (_mirrorPreviewPart == null)
+            return;
+
+        _mirrorPreviewPart.InitializeForPlacement();
+        _mirrorPreviewRenderers = _mirrorPreviewPart.GetComponentsInChildren<Renderer>(includeInactive: false);
+        _lastMirrorSnap = default;
+        _isMirrorPlacementValid = false;
+        ApplyPreviewTint(_invalidPreviewColor, _mirrorPreviewRenderers);
+        SetMirrorPreviewVisible(false);
     }
 
+    private void DestroyMirrorPreview()
+    {
+        if (_mirrorPreviewPart != null)
+        {
+            Destroy(_mirrorPreviewPart.gameObject);
+            _mirrorPreviewPart = null;
+        }
+
+        _mirrorPreviewRenderers = null;
+        _lastMirrorSnap = default;
+        _isMirrorPlacementValid = false;
+    }
+    
     private void Update()
     {
-        if (_currentPreviewPart == null) return;
-        if (Mouse.current == null) return;
+        if (Mouse.current == null)
+            return;
 
+        // If we are not currently previewing anything, do nothing.
+        if (_currentPreviewPart == null)
+            return;
+
+        // Right click cancels preview.
         if (Mouse.current.rightButton.wasPressedThisFrame)
         {
             CancelPreview();
@@ -140,100 +224,162 @@ public sealed class PlacementPreview : MonoBehaviour
         ApplyRotationInput();
         _currentPreviewPart.transform.rotation = Quaternion.Euler(0f, _previewYawDegrees, 0f);
 
-        if (!TryGetMouseSurfaceHit(out RaycastHit hit))
+        // Keep mirror preview hidden while solving the primary preview to avoid self-targeting.
+        SetMirrorPreviewVisible(false);
+
+        // 1) Get desired placement point and hovered surface from mouse raycast
+        if (!TryGetMouseSurfaceHit(out RaycastHit surfaceHit))
         {
             _isPlacementValid = false;
+            ApplyPreviewTint(_invalidPreviewColor);
+            _isMirrorPlacementValid = false;
+            SetMirrorPreviewVisible(false);
+            SetSnapIndicatorVisible(false);
             return;
         }
 
-        // Desired point is the surface point the mouse is on (prevents “behind” placement)
-        Vector3 desiredPoint = hit.point;
+        Vector3 desiredPoint = surfaceHit.point;
+        Part preferredTargetPart = surfaceHit.collider != null
+            ? surfaceHit.collider.GetComponentInParent<Part>()
+            : null;
+        Vector3 preferredSurfaceNormal = surfaceHit.normal;
 
-        // If the mouse is hitting a part, prefer snapping to THAT part face
-        Part hitPart = hit.collider != null ? hit.collider.GetComponentInParent<Part>() : null;
-        Vector3 hitNormal = hit.normal;
-
-        _lastSnap = (_snapSystem != null)
-            ? _snapSystem.FindBestSnap(_currentPreviewPart, desiredPoint, hitPart, hitNormal)
+        // 2) Ask SnapSystem for the best snap near this point, biased to hovered face/part.
+        _lastSnap = _snapSystem != null
+            ? _snapSystem.FindBestSnap(
+                _currentPreviewPart,
+                desiredPoint,
+                preferredTargetPart,
+                preferredSurfaceNormal)
             : default;
 
+        // 3) Move preview part: snapped position if valid, otherwise follow desired point
         Vector3 targetPos = _lastSnap.IsValid ? _lastSnap.SnappedWorldPosition : desiredPoint;
         _currentPreviewPart.transform.position = targetPos;
 
-        _isPlacementValid = CheckPlacementValid(_currentPreviewPart);
-        if (_requireSnapForPlacement && !_lastSnap.IsValid)
-            _isPlacementValid = false;
+        // 4) Validate placement (prevents part-inside-part)
+        _isPlacementValid = CheckPlacementValid(_currentPreviewPart, _mirrorPreviewPart != null ? _mirrorPreviewPart.transform : null);
+        ApplyPreviewTint(_isPlacementValid ? _validPreviewColor : _invalidPreviewColor);
+        UpdateMirrorPreviewFromPrimary();
+        UpdateSnapIndicator();
 
+        // 5) Place on left click (only if valid)
         if (Mouse.current.leftButton.wasPressedThisFrame && _isPlacementValid)
         {
             PlaceCurrent();
         }
     }
 
-    private bool TryGetMouseSurfaceHit(out RaycastHit hit)
+    
+    /// <summary>
+    /// Raycast from mouse cursor to world surfaces (ground + parts), ignoring preview colliders.
+    /// </summary>
+    private bool TryGetMouseSurfaceHit(out RaycastHit bestHit)
     {
-        hit = default;
-        if (_camera == null) return false;
+        bestHit = default;
+
+        if (_camera == null)
+        {
+            Debug.LogError("[PlacementPreview] No camera assigned.", this);
+            return false;
+        }
 
         Vector2 mousePos = Mouse.current.position.ReadValue();
         Ray ray = _camera.ScreenPointToRay(mousePos);
+        int surfaceMask = GetSurfaceRaycastMask();
+        int hitCount = Physics.RaycastNonAlloc(ray, _raycastBuffer, _maxRayDistance, surfaceMask, QueryTriggerInteraction.Ignore);
+        if (hitCount <= 0) return false;
 
-        return Physics.Raycast(ray, out hit, _maxRayDistance, _surfaceLayer, QueryTriggerInteraction.Ignore);
-    }
-
-    private bool CheckPlacementValid(Part previewPart)
-    {
-        Collider[] previewColliders = _previewColliders;
-        if (previewColliders == null || previewColliders.Length == 0 || !HasLiveCollider(previewColliders))
+        float bestDistance = float.PositiveInfinity;
+        for (int i = 0; i < hitCount; i++)
         {
-            previewColliders = previewPart.GetComponentsInChildren<Collider>(includeInactive: false);
-            _previewColliders = previewColliders;
-        }
+            RaycastHit hit = _raycastBuffer[i];
+            if (hit.collider == null) continue;
 
-        if (previewColliders == null || previewColliders.Length == 0) return false;
+            if (_currentPreviewPart != null && hit.collider.transform.IsChildOf(_currentPreviewPart.transform))
+                continue;
+            if (_mirrorPreviewPart != null && hit.collider.transform.IsChildOf(_mirrorPreviewPart.transform))
+                continue;
 
-        for (int i = 0; i < previewColliders.Length; i++)
-        {
-            Collider c = previewColliders[i];
-            if (c == null) continue;
-
-            Bounds b = c.bounds;
-
-            Vector3 halfExtents = b.extents - Vector3.one * _overlapShrink;
-            halfExtents = Vector3.Max(halfExtents, Vector3.zero);
-
-            int count = Physics.OverlapBoxNonAlloc(
-                b.center,
-                halfExtents,
-                _overlapBuffer,
-                Quaternion.identity,
-                _partLayer,
-                QueryTriggerInteraction.Ignore
-            );
-
-            for (int k = 0; k < count; k++)
+            if (hit.distance < bestDistance)
             {
-                Collider other = _overlapBuffer[k];
-                if (other == null) continue;
-
-                // ignore our own colliders
-                if (other.transform.IsChildOf(previewPart.transform)) continue;
-
-                return false;
+                bestDistance = hit.distance;
+                bestHit = hit;
             }
         }
 
-        return true;
+        return bestDistance < float.PositiveInfinity;
     }
 
-    private static bool HasLiveCollider(Collider[] colliders)
+    private int GetSurfaceRaycastMask()
     {
-        for (int i = 0; i < colliders.Length; i++)
+        int combined = _surfaceLayer.value | _partLayer.value;
+        return combined != 0 ? combined : Physics.DefaultRaycastLayers;
+    }
+
+    private void UpdateMirrorPreviewFromPrimary()
+    {
+        if (!_isMirrorModeEnabled || _mirrorReference == null || _currentPreviewPart == null)
         {
-            if (colliders[i] != null) return true;
+            _isMirrorPlacementValid = false;
+            _lastMirrorSnap = default;
+            SetMirrorPreviewVisible(false);
+            return;
         }
 
-        return false;
+        EnsureMirrorPreviewExists();
+        if (_mirrorPreviewPart == null)
+        {
+            _isMirrorPlacementValid = false;
+            _lastMirrorSnap = default;
+            return;
+        }
+
+        Vector3 planePoint = _mirrorReference.position;
+        Vector3 planeNormal = _mirrorReference.right.normalized;
+        if (planeNormal.sqrMagnitude <= 0.0001f)
+        {
+            _isMirrorPlacementValid = false;
+            _lastMirrorSnap = default;
+            SetMirrorPreviewVisible(false);
+            return;
+        }
+
+        Vector3 sourcePos = _currentPreviewPart.transform.position;
+        float distanceToPlane = Mathf.Abs(Vector3.Dot(sourcePos - planePoint, planeNormal));
+        if (distanceToPlane <= _mirrorPlaneDeadZone)
+        {
+            _isMirrorPlacementValid = false;
+            _lastMirrorSnap = default;
+            SetMirrorPreviewVisible(false);
+            return;
+        }
+
+        Vector3 mirroredPos = MirrorPointAcrossPlane(sourcePos, planePoint, planeNormal);
+        Quaternion mirroredRot = MirrorRotationAcrossPlane(_currentPreviewPart.transform.rotation, planeNormal);
+        _mirrorPreviewPart.gameObject.SetActive(true);
+        _mirrorPreviewPart.transform.SetPositionAndRotation(mirroredPos, mirroredRot);
+
+        bool primaryWasActive = _currentPreviewPart.gameObject.activeSelf;
+        if (primaryWasActive)
+            _currentPreviewPart.gameObject.SetActive(false);
+
+        _lastMirrorSnap = _snapSystem != null
+            ? _snapSystem.FindBestSnap(_mirrorPreviewPart, mirroredPos, null, default)
+            : default;
+
+        if (_lastMirrorSnap.IsValid)
+            _mirrorPreviewPart.transform.position = _lastMirrorSnap.SnappedWorldPosition;
+
+        _isMirrorPlacementValid = CheckPlacementValid(_mirrorPreviewPart);
+        if (_requireMirrorSnapConnection && !_lastMirrorSnap.IsValid)
+            _isMirrorPlacementValid = false;
+
+        if (primaryWasActive)
+            _currentPreviewPart.gameObject.SetActive(true);
+
+        ApplyPreviewTint(_isMirrorPlacementValid ? _validPreviewColor : _invalidPreviewColor, _mirrorPreviewRenderers);
+        SetMirrorPreviewVisible(true);
     }
 
     private void ApplyRotationInput()
@@ -247,155 +393,325 @@ public sealed class PlacementPreview : MonoBehaviour
             _previewYawDegrees += _rotationStepDegrees;
     }
 
-    private void PlaceCurrent()
+    private void ApplyPreviewTint(Color color)
     {
-        if (_currentPreviewPart == null)
+        ApplyPreviewTint(color, _previewRenderers);
+    }
+
+    private void ApplyPreviewTint(Color color, Renderer[] renderers)
+    {
+        if (renderers == null) return;
+        if (_previewPropertyBlock == null) return;
+
+        for (int i = 0; i < renderers.Length; i++)
         {
-            if (_debugBuildFlow)
-                Debug.LogWarning("[PlacementPreview] PlaceCurrent called with null _currentPreviewPart.", this);
+            Renderer renderer = renderers[i];
+            if (renderer == null) continue;
+
+            _previewPropertyBlock.Clear();
+            _previewPropertyBlock.SetColor(BaseColorId, color);
+            _previewPropertyBlock.SetColor(ColorId, color);
+            renderer.SetPropertyBlock(_previewPropertyBlock);
+        }
+    }
+
+    private void ClearPreviewTint(Renderer[] renderers)
+    {
+        if (renderers == null) return;
+
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            Renderer renderer = renderers[i];
+            if (renderer == null) continue;
+            renderer.SetPropertyBlock(null);
+        }
+    }
+
+    private void UpdateSnapIndicator()
+    {
+        bool shouldShow = _showSnapIndicator
+            && _lastSnap.IsValid
+            && _lastSnap.TargetNode != null;
+
+        if (!shouldShow)
+        {
+            SetSnapIndicatorVisible(false);
             return;
         }
 
-        GameObject placedPrefab = _activePreviewPrefab;
+        EnsureSnapIndicatorExists();
+        if (_snapIndicator == null) return;
 
-        if (_debugBuildFlow)
-        {
-            string prefabName = placedPrefab != null ? placedPrefab.name : "NULL";
-            Debug.Log($"[PlacementPreview] PlaceCurrent placed={_currentPreviewPart.name} nextPrefab={prefabName}", this);
-        }
-
-        // Build phase: place as finalized but still kinematic until simulation starts.
-        _currentPreviewPart.FinalizePlacement(enableSimulation: false);
-
-        Part placedPart = _currentPreviewPart;
-
-        if (_lastSnap.IsValid && _lastSnap.PreviewNode != null && _lastSnap.TargetNode != null)
-        {
-            TryCreateNodeJoint(_lastSnap.PreviewNode, _lastSnap.TargetNode);
-        }
-
-        if (_autoConnectAdditionalNodes && _currentPreviewPart != null)
-        {
-            AutoConnectRemainingNodes(_currentPreviewPart);
-        }
-
-        if (placedPart != null)
-            PartPlaced?.Invoke(placedPart);
-
-        // V0: stop after one placement
-        _currentPreviewPart = null;
-        _lastSnap = default;
-        _isPlacementValid = false;
-
-        if (placedPrefab != null)
-        {
-            bool spawned = TrySpawnPreview(placedPrefab);
-            if (_debugBuildFlow)
-                Debug.Log($"[PlacementPreview] Continuous spawn result={spawned}", this);
-        }
-        else if (_debugBuildFlow)
-        {
-            Debug.LogWarning("[PlacementPreview] Continuous spawn skipped: _activePreviewPrefab is null.", this);
-        }
+        _snapIndicator.position = _lastSnap.TargetNode.GetWorldPosition();
+        _snapIndicator.localScale = Vector3.one * _snapIndicatorScale;
+        _snapIndicator.gameObject.SetActive(true);
     }
 
-    private void OnGUI()
+    private void EnsureSnapIndicatorExists()
     {
-        if (_currentPreviewPart == null) return;
-        GUI.Label(new Rect(10, 10, 300, 30), _isPlacementValid ? "PLACEMENT: VALID" : "PLACEMENT: INVALID");
+        if (_snapIndicator != null) return;
+
+        GameObject go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        go.name = "SnapIndicator";
+        go.transform.SetParent(transform, worldPositionStays: true);
+        go.layer = gameObject.layer;
+
+        Collider collider = go.GetComponent<Collider>();
+        if (collider != null)
+        {
+            collider.enabled = false;
+            Destroy(collider);
+        }
+
+        _snapIndicator = go.transform;
+        _snapIndicator.localScale = Vector3.one * _snapIndicatorScale;
+
+        _snapIndicatorRenderer = go.GetComponent<Renderer>();
+        if (_snapIndicatorRenderer != null)
+        {
+            Material indicatorMaterial = _snapIndicatorRenderer.material;
+            indicatorMaterial.color = _snapIndicatorColor;
+        }
+
+        go.SetActive(false);
     }
 
-    private bool TryCreateNodeJoint(ConnectionNode previewNode, ConnectionNode targetNode)
+    private void SetSnapIndicatorVisible(bool visible)
     {
-        if (previewNode == null || targetNode == null) return false;
-        if (!previewNode.CanConnectTo(targetNode)) return false;
+        if (_snapIndicator == null) return;
+        _snapIndicator.gameObject.SetActive(visible);
+    }
 
-        Rigidbody a = previewNode.Owner != null ? previewNode.Owner.GetRigidbody() : null;
-        Rigidbody b = targetNode.Owner != null ? targetNode.Owner.GetRigidbody() : null;
-        if (a == null || b == null) return false;
+    private void SetMirrorPreviewVisible(bool visible)
+    {
+        if (_mirrorPreviewPart == null) return;
+        _mirrorPreviewPart.gameObject.SetActive(visible);
+    }
+    
+    /// <summary>
+    /// Returns false if the preview overlaps any collider on the part layer
+    /// that does NOT belong to the preview itself.
+    /// </summary>
+    private bool CheckPlacementValid(Part previewPart, Transform additionalIgnoredRoot = null)
+    {
+        if (previewPart == null) return false;
+        
+        
 
-        FixedJoint joint = a.gameObject.AddComponent<FixedJoint>();
-        joint.connectedBody = b;
+        // Collect all colliders on the preview part
+        Collider[] previewColliders = previewPart.GetComponentsInChildren<Collider>(includeInactive: false);
+        if (previewColliders == null || previewColliders.Length == 0)
+        {
+            // If the part has no colliders, we can't validate properly.
+            // For V0: consider this invalid to avoid weird placements.
+            return false;
+        }
 
-        Vector3 previewNodeWorld = previewNode.GetWorldPosition();
-        Vector3 targetNodeWorld = targetNode.GetWorldPosition();
+        int solidColliderCount = 0;
+        for (int i = 0; i < previewColliders.Length; i++)
+        {
+            Collider c = previewColliders[i];
+            if (c == null) continue;
+            if (!c.enabled) continue;
+            if (c is WheelCollider) continue;
+            if (c.isTrigger) continue;
 
-        // Define both anchors explicitly to reduce initial solver error.
+            solidColliderCount++;
+
+            // We do an overlap query using the collider's bounds.
+            // This is not perfect geometry-accurate, but it's robust for V0.
+            Bounds b = c.bounds;
+
+            Vector3 center = b.center;
+            // Shrink bounds a bit so perfectly flush faces are considered valid.
+            Vector3 halfExtents = b.extents - Vector3.one * _overlapPadding;
+            halfExtents = new Vector3(
+                Mathf.Max(0.001f, halfExtents.x),
+                Mathf.Max(0.001f, halfExtents.y),
+                Mathf.Max(0.001f, halfExtents.z)
+            );
+
+            int hitCount = Physics.OverlapBoxNonAlloc(
+                center,
+                halfExtents,
+                _overlapBuffer,
+                Quaternion.identity,  // bounds are axis-aligned in world space
+                _partLayer,
+                QueryTriggerInteraction.Ignore
+            );
+
+            for (int h = 0; h < hitCount; h++)
+            {
+                Collider hit = _overlapBuffer[h];
+                if (hit == null) continue;
+
+                // Ignore collisions with our own preview colliders
+                if (hit.transform.IsChildOf(previewPart.transform))
+                    continue;
+
+                if (additionalIgnoredRoot != null && hit.transform.IsChildOf(additionalIgnoredRoot))
+                    continue;
+
+                // We found overlap with some other placed part collider => invalid placement
+                return false;
+            }
+        }
+
+        return solidColliderCount > 0;
+    }
+
+    private void ConfigurePlacedJoint(
+        FixedJoint joint,
+        Rigidbody previewRb,
+        Rigidbody targetRb,
+        ConnectionNode previewNode,
+        ConnectionNode targetNode)
+    {
+        if (joint == null || previewRb == null || targetRb == null || previewNode == null || targetNode == null)
+            return;
+
         joint.autoConfigureConnectedAnchor = _autoConfigureConnectedAnchor;
-        joint.anchor = a.transform.InverseTransformPoint(previewNodeWorld);
+        joint.anchor = previewRb.transform.InverseTransformPoint(previewNode.GetWorldPosition());
         if (!_autoConfigureConnectedAnchor)
-        {
-            joint.connectedAnchor = b.transform.InverseTransformPoint(targetNodeWorld);
-        }
+            joint.connectedAnchor = targetRb.transform.InverseTransformPoint(targetNode.GetWorldPosition());
 
         joint.enablePreprocessing = _enablePreprocessing;
         joint.enableCollision = _enableCollisionBetweenConnectedBodies;
         joint.breakForce = _jointBreakForce;
         joint.breakTorque = _jointBreakTorque;
-        joint.massScale = _jointMassScale;
-        joint.connectedMassScale = _jointConnectedMassScale;
-
-        previewNode.MarkConnected(targetNode);
-        return true;
+        joint.massScale = Mathf.Max(0.01f, _jointMassScale);
+        joint.connectedMassScale = Mathf.Max(0.01f, _jointConnectedMassScale);
     }
 
-    private void AutoConnectRemainingNodes(Part placedPart)
+    /// <summary>
+    /// Finalize the preview into a real physics part and connect joint if snapped.
+    /// </summary>
+    private void PlaceCurrent()
     {
-        float secondarySnapRadius = (_snapSystem != null && _snapSystem.SnapRadius > 0f)
-            ? _snapSystem.SnapRadius
-            : 0.5f;
+        if (_currentPreviewPart == null)
+            return;
 
-        var nodes = placedPart.GetNodes();
-        if (nodes == null || nodes.Count == 0) return;
+        Part placedPart = _currentPreviewPart;
+        Renderer[] placedRenderers = _previewRenderers;
+        SnapSystem.SnapResult primarySnap = _lastSnap;
 
-        for (int i = 0; i < nodes.Count; i++)
+        Part mirroredPlacedPart = null;
+        Renderer[] mirroredPlacedRenderers = null;
+        SnapSystem.SnapResult mirroredSnap = _lastMirrorSnap;
+
+        if (_isMirrorModeEnabled
+            && _mirrorPreviewPart != null
+            && _mirrorPreviewPart.gameObject.activeInHierarchy
+            && _isMirrorPlacementValid)
         {
-            ConnectionNode previewNode = nodes[i];
-            if (previewNode == null || previewNode.IsOccupied) continue;
+            mirroredPlacedPart = _mirrorPreviewPart;
+            mirroredPlacedRenderers = _mirrorPreviewRenderers;
+        }
+        else if (_mirrorPreviewPart != null)
+        {
+            Destroy(_mirrorPreviewPart.gameObject);
+        }
 
-            int hitCount = Physics.OverlapSphereNonAlloc(
-                previewNode.GetWorldPosition(),
-                secondarySnapRadius,
-                _overlapBuffer,
-                _partLayer,
-                QueryTriggerInteraction.Ignore
-            );
+        _mirrorPreviewPart = null;
+        _mirrorPreviewRenderers = null;
+        _lastMirrorSnap = default;
+        _isMirrorPlacementValid = false;
 
-            ConnectionNode bestTarget = null;
-            float bestDistance = float.PositiveInfinity;
+        // Convert preview -> real physics object
+        ClearPreviewTint(placedRenderers);
+        placedPart.FinalizePlacement();
 
-            for (int h = 0; h < hitCount; h++)
+        // If we have a valid snap, create a FixedJoint
+        if (primarySnap.IsValid && primarySnap.PreviewNode != null && primarySnap.TargetNode != null)
+        {
+            Rigidbody previewRb = primarySnap.PreviewNode.Owner != null ? primarySnap.PreviewNode.Owner.GetRigidbody() : null;
+            Rigidbody targetRb  = primarySnap.TargetNode.Owner  != null ? primarySnap.TargetNode.Owner.GetRigidbody()  : null;
+
+            if (previewRb != null && targetRb != null)
             {
-                Collider col = _overlapBuffer[h];
-                if (col == null) continue;
+                // Create joint on preview part, connect to target part
+                FixedJoint joint = previewRb.gameObject.AddComponent<FixedJoint>();
+                joint.connectedBody = targetRb;
+                ConfigurePlacedJoint(joint, previewRb, targetRb, primarySnap.PreviewNode, primarySnap.TargetNode);
 
-                Part targetPart = col.GetComponentInParent<Part>();
-                if (targetPart == null || targetPart == placedPart) continue;
+                // Mark nodes as connected (updates occupancy + pairing)
+                primarySnap.PreviewNode.MarkConnected(primarySnap.TargetNode);
+            }
+            else
+            {
+                Debug.LogWarning("[PlacementPreview] Snap valid but missing rigidbodies for joint creation.", this);
+            }
+        }
 
-                var targetNodes = targetPart.GetNodes();
-                if (targetNodes == null || targetNodes.Count == 0) continue;
+        PartPlaced?.Invoke(placedPart);
 
-                for (int t = 0; t < targetNodes.Count; t++)
+        if (mirroredPlacedPart != null)
+        {
+            ClearPreviewTint(mirroredPlacedRenderers);
+            mirroredPlacedPart.FinalizePlacement();
+
+            if (mirroredSnap.IsValid && mirroredSnap.PreviewNode != null && mirroredSnap.TargetNode != null)
+            {
+                Rigidbody previewRb = mirroredSnap.PreviewNode.Owner != null ? mirroredSnap.PreviewNode.Owner.GetRigidbody() : null;
+                Rigidbody targetRb = mirroredSnap.TargetNode.Owner != null ? mirroredSnap.TargetNode.Owner.GetRigidbody() : null;
+
+                if (previewRb != null && targetRb != null)
                 {
-                    ConnectionNode targetNode = targetNodes[t];
-                    if (targetNode == null) continue;
-                    if (!previewNode.CanConnectTo(targetNode)) continue;
-
-                    float d = Vector3.Distance(previewNode.GetWorldPosition(), targetNode.GetWorldPosition());
-                    if (d > secondarySnapRadius) continue;
-
-                    if (d < bestDistance)
-                    {
-                        bestDistance = d;
-                        bestTarget = targetNode;
-                    }
+                    FixedJoint joint = previewRb.gameObject.AddComponent<FixedJoint>();
+                    joint.connectedBody = targetRb;
+                    ConfigurePlacedJoint(joint, previewRb, targetRb, mirroredSnap.PreviewNode, mirroredSnap.TargetNode);
+                    mirroredSnap.PreviewNode.MarkConnected(mirroredSnap.TargetNode);
                 }
             }
 
-            if (bestTarget != null)
-            {
-                TryCreateNodeJoint(previewNode, bestTarget);
-            }
+            PartPlaced?.Invoke(mirroredPlacedPart);
+        }
+
+        // Continuous build: spawn the same selected part again.
+        _currentPreviewPart = null;
+        _previewRenderers = null;
+        _lastSnap = default;
+        _isPlacementValid = false;
+        SetSnapIndicatorVisible(false);
+
+        if (_activePreviewPrefab != null)
+        {
+            TrySpawnPreview(_activePreviewPrefab);
         }
     }
+
+    private static Vector3 MirrorPointAcrossPlane(Vector3 point, Vector3 planePoint, Vector3 planeNormal)
+    {
+        Vector3 n = planeNormal.normalized;
+        Vector3 toPoint = point - planePoint;
+        return point - 2f * Vector3.Dot(toPoint, n) * n;
+    }
+
+    private static Quaternion MirrorRotationAcrossPlane(Quaternion rotation, Vector3 planeNormal)
+    {
+        Vector3 n = planeNormal.normalized;
+        Vector3 mirroredForward = Vector3.Reflect(rotation * Vector3.forward, n);
+        Vector3 mirroredUp = Vector3.Reflect(rotation * Vector3.up, n);
+
+        if (mirroredForward.sqrMagnitude <= 0.0001f)
+            mirroredForward = Vector3.forward;
+        if (mirroredUp.sqrMagnitude <= 0.0001f)
+            mirroredUp = Vector3.up;
+
+        return Quaternion.LookRotation(mirroredForward.normalized, mirroredUp.normalized);
+    }
+
+    // Optional: quick debug so you can see validity while playing.
+    // You can remove this later.
+    private void OnGUI()
+    {
+        if (_currentPreviewPart == null) return;
+
+        string text = _isPlacementValid ? "PLACEMENT: VALID" : "PLACEMENT: INVALID";
+        string snap = _lastSnap.IsValid ? $" | SNAP {Mathf.Max(0f, _lastSnap.Distance):F2}m" : " | SNAP NONE";
+        string hint = $" | ROTATE [{_rotateLeftKey}/{_rotateRightKey}]";
+        string mirror = _isMirrorModeEnabled ? (_isMirrorPlacementValid ? " | MIRROR ON: VALID" : " | MIRROR ON: INVALID") : " | MIRROR OFF";
+        GUI.Label(new Rect(10, 10, 800, 30), text + snap + hint + mirror);
+    }
+
 }

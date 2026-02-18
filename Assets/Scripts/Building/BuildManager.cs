@@ -1,5 +1,6 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
+using UnityEngine.Serialization;
 using System.Collections.Generic;
 using System;
 using System.IO;
@@ -28,6 +29,7 @@ public sealed class BuildManager : MonoBehaviour
     [SerializeField] private Key _clearBuildKey = Key.C;
     [SerializeField] private Key _saveContraptionKey = Key.F5;
     [SerializeField] private Key _loadContraptionKey = Key.F9;
+    [SerializeField] private Key _toggleMirrorModeKey = Key.B;
 
     [Header("Delete Part")]
     [SerializeField] private LayerMask _deletablePartLayer;
@@ -50,16 +52,24 @@ public sealed class BuildManager : MonoBehaviour
     [SerializeField] private Key _throttleReverseKey = Key.K;
     [SerializeField] private Key _steerLeftKey = Key.J;
     [SerializeField] private Key _steerRightKey = Key.L;
-    [SerializeField, Min(0f)] private float _motorForcePerMotor = 1200f;
-    [SerializeField, Min(0f)] private float _steerTorquePerWheel = 150f;
+    [SerializeField] private Key _brakeKey = Key.Space;
+    [FormerlySerializedAs("_motorForcePerMotor")]
+    [SerializeField, Min(0f)] private float _motorTorquePerMotor = 1200f;
+    [SerializeField, Min(0f)] private float _brakeTorque = 2500f;
+    [SerializeField, Min(0f)] private float _fallbackSteerAngle = 28f;
+    [FormerlySerializedAs("_steerTorquePerWheel")]
+    [SerializeField, Min(0f)] private float _fallbackSteerTorquePerWheel = 150f;
 
     [Header("Runtime (read-only)")]
     [SerializeField] private int _selectedIndex = -1;
     [SerializeField] private bool _isSimulationMode;
     [SerializeField] private bool _isCoreMoveMode;
+    [SerializeField] private bool _isMirrorMode;
 
     public int SelectedIndex => _selectedIndex;
     private readonly Stack<Part> _placedHistory = new Stack<Part>();
+    private readonly List<WheelPart> _wheelPartsBuffer = new List<WheelPart>(16);
+    private readonly List<WheelCollider> _fallbackWheelCollidersBuffer = new List<WheelCollider>(16);
 
     [Serializable]
     private struct PartSaveRecord
@@ -95,6 +105,7 @@ public sealed class BuildManager : MonoBehaviour
 
         SetSimulationMode(false);
         EnsureCoreExists();
+        SetMirrorMode(_isMirrorMode);
 
         if (_startPreviewOnEnable)
         {
@@ -124,6 +135,9 @@ public sealed class BuildManager : MonoBehaviour
 
         if (!_isSimulationMode)
         {
+            if (Keyboard.current[_toggleMirrorModeKey].wasPressedThisFrame)
+                SetMirrorMode(!_isMirrorMode);
+
             if (Keyboard.current[_saveContraptionKey].wasPressedThisFrame)
                 SaveContraption();
 
@@ -203,8 +217,15 @@ public sealed class BuildManager : MonoBehaviour
             return;
         }
 
+        Part partPrefab = prefab.GetComponent<Part>();
+        if (partPrefab == null)
+        {
+            Debug.LogWarning($"[BuildManager] Part prefab '{prefab.name}' is missing a Part component on root.", prefab);
+            return;
+        }
+
         _selectedIndex = index;
-        _placementPreview.BeginPreview(prefab);
+        _placementPreview.BeginPreview(partPrefab);
     }
 
     public void CancelBuild()
@@ -243,6 +264,7 @@ public sealed class BuildManager : MonoBehaviour
             {
                 if (_corePrefab != null && string.IsNullOrEmpty(p.RuntimePrefabKey))
                     p.SetRuntimePrefabKey(_corePrefab.name);
+                SetMirrorMode(_isMirrorMode);
                 return;
             }
         }
@@ -268,7 +290,19 @@ public sealed class BuildManager : MonoBehaviour
 
         corePart.SetRuntimePrefabKey(_corePrefab.name);
         // Core is a placed part in build mode (kinematic until simulation starts).
+        corePart.InitializeForPlacement();
         corePart.FinalizePlacement(enableSimulation: false);
+        SetMirrorMode(_isMirrorMode);
+    }
+
+    private void SetMirrorMode(bool enabled)
+    {
+        _isMirrorMode = enabled;
+        if (_placementPreview == null) return;
+
+        Part core = FindCorePart();
+        Transform mirrorReference = core != null ? core.transform : null;
+        _placementPreview.SetMirrorMode(enabled, mirrorReference);
     }
 
     private void SetCoreMoveMode(bool enabled)
@@ -427,31 +461,98 @@ public sealed class BuildManager : MonoBehaviour
         float steer = 0f;
         if (Keyboard.current[_steerRightKey].isPressed) steer += 1f;
         if (Keyboard.current[_steerLeftKey].isPressed) steer -= 1f;
-
-        if (Mathf.Approximately(throttle, 0f) && Mathf.Approximately(steer, 0f))
-            return;
+        bool braking = Keyboard.current[_brakeKey].isPressed;
 
         var assembly = CollectConnectedParts(core);
         int motorCount = 0;
-        int wheelCount = 0;
+        _wheelPartsBuffer.Clear();
+        _fallbackWheelCollidersBuffer.Clear();
 
         foreach (Part part in assembly)
         {
             if (part == null) continue;
-            if (part.PartType == PartType.Motor) motorCount++;
-            if (part.PartType == PartType.Wheel) wheelCount++;
+            if (part.PartType == PartType.Motor)
+                motorCount++;
+
+            if (part.PartType != PartType.Wheel)
+                continue;
+
+            WheelPart[] wheelParts = part.GetComponentsInChildren<WheelPart>(includeInactive: true);
+            bool hasWheelPart = false;
+            if (wheelParts != null)
+            {
+                for (int i = 0; i < wheelParts.Length; i++)
+                {
+                    WheelPart wheelPart = wheelParts[i];
+                    if (wheelPart == null || !wheelPart.IsReady) continue;
+                    _wheelPartsBuffer.Add(wheelPart);
+                    hasWheelPart = true;
+                }
+            }
+
+            if (hasWheelPart)
+                continue;
+
+            WheelCollider[] fallbackColliders = part.GetComponentsInChildren<WheelCollider>(includeInactive: true);
+            if (fallbackColliders == null) continue;
+            for (int i = 0; i < fallbackColliders.Length; i++)
+            {
+                WheelCollider wheelCollider = fallbackColliders[i];
+                if (wheelCollider == null) continue;
+                _fallbackWheelCollidersBuffer.Add(wheelCollider);
+            }
         }
 
-        if (motorCount <= 0 || wheelCount <= 0) return;
+        if (_wheelPartsBuffer.Count == 0 && _fallbackWheelCollidersBuffer.Count == 0)
+            return;
 
-        Vector3 forward = Vector3.ProjectOnPlane(core.transform.forward, Vector3.up).normalized;
-        if (forward.sqrMagnitude <= 0.0001f) return;
+        int drivenWheelCount = 0;
+        for (int i = 0; i < _wheelPartsBuffer.Count; i++)
+        {
+            WheelPart wheelPart = _wheelPartsBuffer[i];
+            if (wheelPart == null || !wheelPart.IsDriven) continue;
+            drivenWheelCount++;
+        }
 
-        float motorForce = throttle * _motorForcePerMotor * motorCount;
-        float steerTorque = steer * _steerTorquePerWheel * wheelCount;
+        if (_wheelPartsBuffer.Count == 0)
+            drivenWheelCount = _fallbackWheelCollidersBuffer.Count;
 
-        coreRb.AddForce(forward * motorForce, ForceMode.Force);
-        coreRb.AddTorque(Vector3.up * steerTorque, ForceMode.Force);
+        float totalMotorTorque = (motorCount > 0)
+            ? throttle * _motorTorquePerMotor * motorCount
+            : 0f;
+        float motorTorquePerDrivenWheel = (drivenWheelCount > 0)
+            ? totalMotorTorque / drivenWheelCount
+            : 0f;
+        float brakeTorque = braking ? _brakeTorque : 0f;
+
+        if (_wheelPartsBuffer.Count > 0)
+        {
+            for (int i = 0; i < _wheelPartsBuffer.Count; i++)
+            {
+                WheelPart wheelPart = _wheelPartsBuffer[i];
+                if (wheelPart == null) continue;
+                wheelPart.ApplyDrive(motorTorquePerDrivenWheel, steer, brakeTorque);
+            }
+
+            return;
+        }
+
+        float steerAngle = Mathf.Clamp(steer, -1f, 1f) * _fallbackSteerAngle;
+        for (int i = 0; i < _fallbackWheelCollidersBuffer.Count; i++)
+        {
+            WheelCollider wheelCollider = _fallbackWheelCollidersBuffer[i];
+            if (wheelCollider == null || !wheelCollider.enabled) continue;
+
+            wheelCollider.motorTorque = motorTorquePerDrivenWheel;
+            wheelCollider.steerAngle = steerAngle;
+            wheelCollider.brakeTorque = brakeTorque;
+        }
+
+        if (!Mathf.Approximately(steer, 0f) && _fallbackSteerTorquePerWheel > 0f)
+        {
+            float steerTorque = steer * _fallbackSteerTorquePerWheel * _fallbackWheelCollidersBuffer.Count;
+            coreRb.AddTorque(Vector3.up * steerTorque, ForceMode.Force);
+        }
     }
 
     private void TryDeleteHoveredPart()

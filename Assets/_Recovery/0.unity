@@ -577,31 +577,14 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::PlacementPreview
   _camera: {fileID: 330585545}
   _snapSystem: {fileID: 614605443}
-  _surfaceLayer:
+  _groundLayer:
     serializedVersion: 2
     m_Bits: 192
   _maxRayDistance: 200
-  _rotationStepDegrees: 15
-  _rotateLeftKey: 40
-  _rotateRightKey: 38
-  _showSnapIndicator: 1
-  _snapIndicatorScale: 0.08
-  _snapIndicatorColor: {r: 0.2, g: 1, b: 0.25, a: 1}
-  _validPreviewColor: {r: 0.65, g: 0.9, b: 1, a: 0.85}
-  _invalidPreviewColor: {r: 1, g: 0.35, b: 0.35, a: 0.85}
   _partLayer:
     serializedVersion: 2
     m_Bits: 64
   _overlapPadding: 0.01
-  _autoConfigureConnectedAnchor: 0
-  _enablePreprocessing: 0
-  _enableCollisionBetweenConnectedBodies: 0
-  _jointBreakForce: Infinity
-  _jointBreakTorque: Infinity
-  _jointMassScale: 1
-  _jointConnectedMassScale: 1
-  _requireMirrorSnapConnection: 1
-  _mirrorPlaneDeadZone: 0.02
 --- !u!114 &614605446
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -617,14 +600,10 @@ MonoBehaviour:
   _placementPreview: {fileID: 614605445}
   _camera: {fileID: 330585545}
   _partPrefabs:
-  - {fileID: 8187985673115563136, guid: 068a0fffb8112a346a3c6d8c0ba328e7, type: 3}
-  - {fileID: 9124091467310032088, guid: a32e997240a9bec4aa02edd82fafff40, type: 3}
-  - {fileID: 4819979865673199329, guid: 9d31131f7ad0c354da0f4ecc2c320295, type: 3}
-  - {fileID: 2908772040049632155, guid: fc31cc466895f4b4095def6c55f41c5d, type: 3}
-  - {fileID: 1401997208626541228, guid: 3e027d75aee2d14469e9ec753ba10a5c, type: 3}
-  - {fileID: 6270235089365974938, guid: abfad530c3e21704fa1c3ba199fa83a0, type: 3}
+  - {fileID: 4359630450182534689, guid: 855d087bc8a351bb0b2d217ea35d49bd, type: 3}
+  - {fileID: 2702602368208641832, guid: 5b2db23b67e37f8b4b894dcd2653eaa4, type: 3}
   _defaultSelectedIndex: 0
-  _corePrefab: {fileID: 8945109441507529779, guid: 3720e267822b8b445a535df101184a96, type: 3}
+  _corePrefab: {fileID: 4359630450182534689, guid: fa635b50d1b9a219da101cfbff80af88, type: 3}
   _coreSpawnPosition: {x: 0, y: 1, z: 0}
   _coreSpawnRotation: {x: 0, y: 0, z: 0, w: 1}
   _startPreviewOnEnable: 1
@@ -635,7 +614,6 @@ MonoBehaviour:
   _clearBuildKey: 17
   _saveContraptionKey: 98
   _loadContraptionKey: 102
-  _toggleMirrorModeKey: 16
   _deletablePartLayer:
     serializedVersion: 2
     m_Bits: 64
@@ -661,7 +639,6 @@ MonoBehaviour:
   _selectedIndex: -1
   _isSimulationMode: 0
   _isCoreMoveMode: 0
-  _isMirrorMode: 0
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0
@@ -922,37 +899,6 @@ RectTransform:
   m_AnchoredPosition: {x: 0, y: 0}
   m_SizeDelta: {x: 0, y: 0}
   m_Pivot: {x: 0, y: 0}
---- !u!1 &1824060464
-GameObject:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  serializedVersion: 6
-  m_Component:
-  - component: {fileID: 1824060465}
-  m_Layer: 6
-  m_Name: Global Rules
-  m_TagString: Untagged
-  m_Icon: {fileID: 0}
-  m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 1
---- !u!4 &1824060465
-Transform:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1824060464}
-  serializedVersion: 2
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0.82046, y: 0, z: -3.50928}
-  m_LocalScale: {x: 1, y: 1, z: 1}
-  m_ConstrainProportionsScale: 0
-  m_Children: []
-  m_Father: {fileID: 0}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &2141251306
 GameObject:
   m_ObjectHideFlags: 0
@@ -1015,4 +961,3 @@ SceneRoots:
   - {fileID: 2141251308}
   - {fileID: 1806560915}
   - {fileID: 1210120695}
-  - {fileID: 1824060465}

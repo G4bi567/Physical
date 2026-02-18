@@ -58,6 +58,7 @@ public sealed class ConnectionNode : MonoBehaviour
 
         if (!IsKindCompatible(_compatibleWith, other._kind)) return false;
         if (!IsKindCompatible(other._compatibleWith, _kind)) return false;
+        if (!PartConnectionRules.IsConnectionAllowed(_owner.PartType, _kind, other._owner.PartType, other._kind)) return false;
 
         // Must face each other (prevents “snap inside” from same-side)
         float facingDot = Vector3.Dot(Outward, other.Outward);
