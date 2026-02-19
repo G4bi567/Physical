@@ -40,6 +40,8 @@ public class PlacementPreview : MonoBehaviour
     [SerializeField] private float _jointBreakTorque = Mathf.Infinity;
     [SerializeField, Min(0.01f)] private float _jointMassScale = 1f;
     [SerializeField, Min(0.01f)] private float _jointConnectedMassScale = 1f;
+    [SerializeField, Min(0.001f)] private float _secondarySnapDistance = 0.015f;
+    [SerializeField, Min(0)] private int _maxSecondaryLoopJointsPerPart = 1;
 
     [Header("Mirror Rules")]
     [SerializeField] private bool _requireMirrorSnapConnection = true;
@@ -64,6 +66,7 @@ public class PlacementPreview : MonoBehaviour
     // Reused buffer to avoid allocations each frame during overlap checks
     private readonly Collider[] _overlapBuffer = new Collider[64];
     private readonly RaycastHit[] _raycastBuffer = new RaycastHit[32];
+    private readonly System.Collections.Generic.HashSet<ConnectionNode> _usedSecondaryTargets = new System.Collections.Generic.HashSet<ConnectionNode>();
     private MaterialPropertyBlock _previewPropertyBlock;
 
     private static readonly int BaseColorId = Shader.PropertyToID("_BaseColor");
@@ -258,7 +261,12 @@ public class PlacementPreview : MonoBehaviour
         _currentPreviewPart.transform.position = targetPos;
 
         // 4) Validate placement (prevents part-inside-part)
-        _isPlacementValid = CheckPlacementValid(_currentPreviewPart, _mirrorPreviewPart != null ? _mirrorPreviewPart.transform : null);
+        Transform primarySnapTargetRoot = GetSnapTargetRoot(_lastSnap);
+        _isPlacementValid = CheckPlacementValid(
+            _currentPreviewPart,
+            _mirrorPreviewPart != null ? _mirrorPreviewPart.transform : null,
+            primarySnapTargetRoot
+        );
         ApplyPreviewTint(_isPlacementValid ? _validPreviewColor : _invalidPreviewColor);
         UpdateMirrorPreviewFromPrimary();
         UpdateSnapIndicator();
@@ -371,7 +379,8 @@ public class PlacementPreview : MonoBehaviour
         if (_lastMirrorSnap.IsValid)
             _mirrorPreviewPart.transform.position = _lastMirrorSnap.SnappedWorldPosition;
 
-        _isMirrorPlacementValid = CheckPlacementValid(_mirrorPreviewPart);
+        Transform mirrorSnapTargetRoot = GetSnapTargetRoot(_lastMirrorSnap);
+        _isMirrorPlacementValid = CheckPlacementValid(_mirrorPreviewPart, null, mirrorSnapTargetRoot);
         if (_requireMirrorSnapConnection && !_lastMirrorSnap.IsValid)
             _isMirrorPlacementValid = false;
 
@@ -492,7 +501,10 @@ public class PlacementPreview : MonoBehaviour
     /// Returns false if the preview overlaps any collider on the part layer
     /// that does NOT belong to the preview itself.
     /// </summary>
-    private bool CheckPlacementValid(Part previewPart, Transform additionalIgnoredRoot = null)
+    private bool CheckPlacementValid(
+        Part previewPart,
+        Transform additionalIgnoredRoot = null,
+        Transform secondaryIgnoredRoot = null)
     {
         if (previewPart == null) return false;
         
@@ -508,6 +520,7 @@ public class PlacementPreview : MonoBehaviour
         }
 
         int solidColliderCount = 0;
+        bool isWheelPart = previewPart.PartType == PartType.Wheel;
         for (int i = 0; i < previewColliders.Length; i++)
         {
             Collider c = previewColliders[i];
@@ -551,13 +564,28 @@ public class PlacementPreview : MonoBehaviour
 
                 if (additionalIgnoredRoot != null && hit.transform.IsChildOf(additionalIgnoredRoot))
                     continue;
+                if (secondaryIgnoredRoot != null && hit.transform.IsChildOf(secondaryIgnoredRoot))
+                    continue;
 
                 // We found overlap with some other placed part collider => invalid placement
                 return false;
             }
         }
 
-        return solidColliderCount > 0;
+        if (solidColliderCount > 0)
+            return true;
+
+        // Keep wheel placement simple: wheel parts can be collider-light (WheelCollider only).
+        // In that case allow placement and rely on snap + runtime physics for final behavior.
+        return isWheelPart;
+    }
+
+    private static Transform GetSnapTargetRoot(SnapSystem.SnapResult snap)
+    {
+        if (!snap.IsValid || snap.TargetNode == null || snap.TargetNode.Owner == null)
+            return null;
+
+        return snap.TargetNode.Owner.transform;
     }
 
     private void ConfigurePlacedJoint(
@@ -581,6 +609,94 @@ public class PlacementPreview : MonoBehaviour
         joint.breakTorque = _jointBreakTorque;
         joint.massScale = Mathf.Max(0.01f, _jointMassScale);
         joint.connectedMassScale = Mathf.Max(0.01f, _jointConnectedMassScale);
+    }
+
+    private bool TryCreateNodeJoint(ConnectionNode previewNode, ConnectionNode targetNode)
+    {
+        if (previewNode == null || targetNode == null)
+            return false;
+        if (!previewNode.CanConnectTo(targetNode))
+            return false;
+
+        Rigidbody previewRb = previewNode.Owner != null ? previewNode.Owner.GetRigidbody() : null;
+        Rigidbody targetRb = targetNode.Owner != null ? targetNode.Owner.GetRigidbody() : null;
+        if (previewRb == null || targetRb == null || previewRb == targetRb)
+            return false;
+
+        FixedJoint joint = previewRb.gameObject.AddComponent<FixedJoint>();
+        joint.connectedBody = targetRb;
+        ConfigurePlacedJoint(joint, previewRb, targetRb, previewNode, targetNode);
+        previewNode.MarkConnected(targetNode);
+        return true;
+    }
+
+    private int TryCreateSecondaryLoopJoints(Part placedPart)
+    {
+        if (placedPart == null || _secondarySnapDistance <= 0f)
+            return 0;
+        if (_maxSecondaryLoopJointsPerPart <= 0)
+            return 0;
+
+        var nodes = placedPart.GetNodes();
+        if (nodes == null || nodes.Count == 0)
+            return 0;
+
+        int created = 0;
+        _usedSecondaryTargets.Clear();
+
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            ConnectionNode previewNode = nodes[i];
+            if (previewNode == null || previewNode.IsOccupied)
+                continue;
+
+            int hitCount = Physics.OverlapSphereNonAlloc(
+                previewNode.GetWorldPosition(),
+                _secondarySnapDistance,
+                _overlapBuffer,
+                _partLayer,
+                QueryTriggerInteraction.Ignore
+            );
+
+            ConnectionNode bestTarget = null;
+            float bestDistance = _secondarySnapDistance;
+
+            for (int h = 0; h < hitCount; h++)
+            {
+                Collider col = _overlapBuffer[h];
+                if (col == null) continue;
+
+                Part targetPart = col.GetComponentInParent<Part>();
+                if (targetPart == null || targetPart == placedPart) continue;
+
+                var targetNodes = targetPart.GetNodes();
+                if (targetNodes == null || targetNodes.Count == 0) continue;
+
+                for (int t = 0; t < targetNodes.Count; t++)
+                {
+                    ConnectionNode targetNode = targetNodes[t];
+                    if (targetNode == null) continue;
+                    if (_usedSecondaryTargets.Contains(targetNode)) continue;
+                    if (!previewNode.CanConnectTo(targetNode)) continue;
+
+                    float d = Vector3.Distance(previewNode.GetWorldPosition(), targetNode.GetWorldPosition());
+                    if (d > bestDistance) continue;
+
+                    bestDistance = d;
+                    bestTarget = targetNode;
+                }
+            }
+
+            if (bestTarget != null && TryCreateNodeJoint(previewNode, bestTarget))
+            {
+                _usedSecondaryTargets.Add(bestTarget);
+                created++;
+                if (created >= _maxSecondaryLoopJointsPerPart)
+                    break;
+            }
+        }
+
+        return created;
     }
 
     /// <summary>
@@ -621,27 +737,10 @@ public class PlacementPreview : MonoBehaviour
         ClearPreviewTint(placedRenderers);
         placedPart.FinalizePlacement();
 
-        // If we have a valid snap, create a FixedJoint
         if (primarySnap.IsValid && primarySnap.PreviewNode != null && primarySnap.TargetNode != null)
-        {
-            Rigidbody previewRb = primarySnap.PreviewNode.Owner != null ? primarySnap.PreviewNode.Owner.GetRigidbody() : null;
-            Rigidbody targetRb  = primarySnap.TargetNode.Owner  != null ? primarySnap.TargetNode.Owner.GetRigidbody()  : null;
+            TryCreateNodeJoint(primarySnap.PreviewNode, primarySnap.TargetNode);
 
-            if (previewRb != null && targetRb != null)
-            {
-                // Create joint on preview part, connect to target part
-                FixedJoint joint = previewRb.gameObject.AddComponent<FixedJoint>();
-                joint.connectedBody = targetRb;
-                ConfigurePlacedJoint(joint, previewRb, targetRb, primarySnap.PreviewNode, primarySnap.TargetNode);
-
-                // Mark nodes as connected (updates occupancy + pairing)
-                primarySnap.PreviewNode.MarkConnected(primarySnap.TargetNode);
-            }
-            else
-            {
-                Debug.LogWarning("[PlacementPreview] Snap valid but missing rigidbodies for joint creation.", this);
-            }
-        }
+        TryCreateSecondaryLoopJoints(placedPart);
 
         PartPlaced?.Invoke(placedPart);
 
@@ -651,18 +750,9 @@ public class PlacementPreview : MonoBehaviour
             mirroredPlacedPart.FinalizePlacement();
 
             if (mirroredSnap.IsValid && mirroredSnap.PreviewNode != null && mirroredSnap.TargetNode != null)
-            {
-                Rigidbody previewRb = mirroredSnap.PreviewNode.Owner != null ? mirroredSnap.PreviewNode.Owner.GetRigidbody() : null;
-                Rigidbody targetRb = mirroredSnap.TargetNode.Owner != null ? mirroredSnap.TargetNode.Owner.GetRigidbody() : null;
+                TryCreateNodeJoint(mirroredSnap.PreviewNode, mirroredSnap.TargetNode);
 
-                if (previewRb != null && targetRb != null)
-                {
-                    FixedJoint joint = previewRb.gameObject.AddComponent<FixedJoint>();
-                    joint.connectedBody = targetRb;
-                    ConfigurePlacedJoint(joint, previewRb, targetRb, mirroredSnap.PreviewNode, mirroredSnap.TargetNode);
-                    mirroredSnap.PreviewNode.MarkConnected(mirroredSnap.TargetNode);
-                }
-            }
+            TryCreateSecondaryLoopJoints(mirroredPlacedPart);
 
             PartPlaced?.Invoke(mirroredPlacedPart);
         }
@@ -708,7 +798,9 @@ public class PlacementPreview : MonoBehaviour
         if (_currentPreviewPart == null) return;
 
         string text = _isPlacementValid ? "PLACEMENT: VALID" : "PLACEMENT: INVALID";
-        string snap = _lastSnap.IsValid ? $" | SNAP {Mathf.Max(0f, _lastSnap.Distance):F2}m" : " | SNAP NONE";
+        string snap = _lastSnap.IsValid
+            ? $" | SNAP {Mathf.Max(0f, _lastSnap.Distance):F2}m ({_lastSnap.SupportCount} links)"
+            : " | SNAP NONE";
         string hint = $" | ROTATE [{_rotateLeftKey}/{_rotateRightKey}]";
         string mirror = _isMirrorModeEnabled ? (_isMirrorPlacementValid ? " | MIRROR ON: VALID" : " | MIRROR ON: INVALID") : " | MIRROR OFF";
         GUI.Label(new Rect(10, 10, 800, 30), text + snap + hint + mirror);

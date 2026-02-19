@@ -600,6 +600,8 @@ MonoBehaviour:
   _jointBreakTorque: Infinity
   _jointMassScale: 1
   _jointConnectedMassScale: 1
+  _secondarySnapDistance: 0.06
+  _maxSecondaryLoopJointsPerPart: 1
   _requireMirrorSnapConnection: 1
   _mirrorPlaneDeadZone: 0.02
 --- !u!114 &614605446
@@ -623,6 +625,7 @@ MonoBehaviour:
   - {fileID: 2908772040049632155, guid: fc31cc466895f4b4095def6c55f41c5d, type: 3}
   - {fileID: 1401997208626541228, guid: 3e027d75aee2d14469e9ec753ba10a5c, type: 3}
   - {fileID: 6270235089365974938, guid: abfad530c3e21704fa1c3ba199fa83a0, type: 3}
+  - {fileID: 1869029444830655010, guid: 8be84826c989cfdb59cb71284da178df, type: 3}
   _defaultSelectedIndex: 0
   _corePrefab: {fileID: 8945109441507529779, guid: 3720e267822b8b445a535df101184a96, type: 3}
   _coreSpawnPosition: {x: 0, y: 1, z: 0}
@@ -656,12 +659,25 @@ MonoBehaviour:
   _throttleReverseKey: 25
   _steerLeftKey: 24
   _steerRightKey: 26
-  _motorForcePerMotor: 1200
-  _steerTorquePerWheel: 150
+  _brakeKey: 1
+  _motorTorquePerMotor: 1200
+  _brakeTorque: 2500
+  _idleBrakeTorque: 450
+  _throttleDeadZone: 0.05
+  _fallbackSteerAngle: 28
+  _fallbackSteerTorquePerWheel: 150
+  _globalSolverIterations: 20
+  _globalSolverVelocityIterations: 10
+  _simulationStartSettleTime: 0.12
+  _simulationStartMaxSpeed: 0.5
+  _simulationStartMaxAngularSpeed: 1.5
+  _enableDriveDebugLogs: 1
+  _driveDebugLogInterval: 0.4
   _selectedIndex: -1
   _isSimulationMode: 0
   _isCoreMoveMode: 0
   _isMirrorMode: 0
+  _isSettlingSimulationStart: 0
 --- !u!1 &832575517
 GameObject:
   m_ObjectHideFlags: 0

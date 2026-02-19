@@ -16,6 +16,12 @@ public sealed class Part : MonoBehaviour
     [SerializeField] private bool _isSimulationEnabled;
     [SerializeField] private string _runtimePrefabKey;
 
+    [Header("Physics Stability")]
+    [SerializeField, Min(1)] private int _solverIterations = 20;
+    [SerializeField, Min(1)] private int _solverVelocityIterations = 10;
+    [SerializeField, Min(1f)] private float _maxAngularVelocity = 50f;
+    [SerializeField] private bool _useContinuousCollisionInSimulation = true;
+
     private IReadOnlyList<ConnectionNode> _nodes;
     private WheelCollider[] _wheelColliders;
     private bool _isInitializedForPlacement;
@@ -61,6 +67,7 @@ public sealed class Part : MonoBehaviour
 
         _wheelColliders = GetComponentsInChildren<WheelCollider>(includeInactive: true);
         ValidateRigidbodyMass();
+        ApplyRigidbodyStabilitySettings();
 
         RefreshNodeCache();
 
@@ -97,6 +104,7 @@ public sealed class Part : MonoBehaviour
 
         _rb.isKinematic = true;
         _rb.detectCollisions = false;
+        ApplyRigidbodyStabilitySettings();
         SetWheelCollidersEnabled(false);
         _isFinalized = false;
         _isSimulationEnabled = false;
@@ -132,6 +140,11 @@ public sealed class Part : MonoBehaviour
 
         _rb.isKinematic = !enabled;
         _rb.detectCollisions = true;
+        _rb.collisionDetectionMode = enabled && _useContinuousCollisionInSimulation
+            ? CollisionDetectionMode.ContinuousDynamic
+            : CollisionDetectionMode.Discrete;
+        _rb.interpolation = enabled ? RigidbodyInterpolation.Interpolate : RigidbodyInterpolation.None;
+        ApplyRigidbodyStabilitySettings();
         SetWheelCollidersEnabled(enabled);
         _isSimulationEnabled = enabled;
     }
@@ -144,6 +157,7 @@ public sealed class Part : MonoBehaviour
     private void OnValidate()
     {
         ValidateRigidbodyMass();
+        ApplyRigidbodyStabilitySettings();
         ValidateNodeKindsForPartType();
     }
 
@@ -167,6 +181,17 @@ public sealed class Part : MonoBehaviour
             Debug.LogWarning($"[Part] Rigidbody mass {rb.mass} out of range [{MinMass}, {MaxMass}]. Clamped to {clamped}.", this);
             rb.mass = clamped;
         }
+    }
+
+    private void ApplyRigidbodyStabilitySettings()
+    {
+        Rigidbody rb = _rb != null ? _rb : GetComponent<Rigidbody>();
+        if (rb == null) return;
+
+        _rb = rb;
+        rb.solverIterations = Mathf.Max(1, _solverIterations);
+        rb.solverVelocityIterations = Mathf.Max(1, _solverVelocityIterations);
+        rb.maxAngularVelocity = Mathf.Max(1f, _maxAngularVelocity);
     }
 
     private void ValidateNodeKindsForPartType()

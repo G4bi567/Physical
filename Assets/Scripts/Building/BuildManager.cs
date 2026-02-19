@@ -4,6 +4,7 @@ using UnityEngine.Serialization;
 using System.Collections.Generic;
 using System;
 using System.IO;
+using System.Collections;
 
 public sealed class BuildManager : MonoBehaviour
 {
@@ -56,20 +57,36 @@ public sealed class BuildManager : MonoBehaviour
     [FormerlySerializedAs("_motorForcePerMotor")]
     [SerializeField, Min(0f)] private float _motorTorquePerMotor = 1200f;
     [SerializeField, Min(0f)] private float _brakeTorque = 2500f;
+    [SerializeField, Min(0f)] private float _idleBrakeTorque = 450f;
+    [SerializeField, Range(0f, 1f)] private float _throttleDeadZone = 0.05f;
     [SerializeField, Min(0f)] private float _fallbackSteerAngle = 28f;
     [FormerlySerializedAs("_steerTorquePerWheel")]
     [SerializeField, Min(0f)] private float _fallbackSteerTorquePerWheel = 150f;
+
+    [Header("Simulation Stability")]
+    [SerializeField, Min(1)] private int _globalSolverIterations = 20;
+    [SerializeField, Min(1)] private int _globalSolverVelocityIterations = 10;
+    [SerializeField, Min(0f)] private float _simulationStartSettleTime = 0.12f;
+    [SerializeField, Min(0f)] private float _simulationStartMaxSpeed = 0.5f;
+    [SerializeField, Min(0f)] private float _simulationStartMaxAngularSpeed = 1.5f;
+    [Header("Drive Debug")]
+    [SerializeField] private bool _enableDriveDebugLogs = false;
+    [SerializeField, Min(0.05f)] private float _driveDebugLogInterval = 0.4f;
 
     [Header("Runtime (read-only)")]
     [SerializeField] private int _selectedIndex = -1;
     [SerializeField] private bool _isSimulationMode;
     [SerializeField] private bool _isCoreMoveMode;
     [SerializeField] private bool _isMirrorMode;
+    [SerializeField] private bool _isSettlingSimulationStart;
 
     public int SelectedIndex => _selectedIndex;
+    public bool IsSimulationMode => _isSimulationMode;
     private readonly Stack<Part> _placedHistory = new Stack<Part>();
     private readonly List<WheelPart> _wheelPartsBuffer = new List<WheelPart>(16);
     private readonly List<WheelCollider> _fallbackWheelCollidersBuffer = new List<WheelCollider>(16);
+    private Coroutine _simulationSettleRoutine;
+    private float _nextDriveDebugLogTime;
 
     [Serializable]
     private struct PartSaveRecord
@@ -240,6 +257,16 @@ public sealed class BuildManager : MonoBehaviour
         if (enabled && _isCoreMoveMode)
             SetCoreMoveMode(false);
 
+        if (_simulationSettleRoutine != null)
+        {
+            StopCoroutine(_simulationSettleRoutine);
+            _simulationSettleRoutine = null;
+        }
+        _isSettlingSimulationStart = false;
+
+        Physics.defaultSolverIterations = Mathf.Max(1, _globalSolverIterations);
+        Physics.defaultSolverVelocityIterations = Mathf.Max(1, _globalSolverVelocityIterations);
+
         Part[] parts = FindObjectsByType<Part>(FindObjectsSortMode.None);
         for (int i = 0; i < parts.Length; i++)
         {
@@ -251,6 +278,7 @@ public sealed class BuildManager : MonoBehaviour
         if (enabled)
         {
             CancelBuild();
+            _simulationSettleRoutine = StartCoroutine(SettleSimulationStart());
         }
     }
 
@@ -446,17 +474,36 @@ public sealed class BuildManager : MonoBehaviour
     private void UpdateDriveInput()
     {
         if (Keyboard.current == null) return;
+        if (_isSettlingSimulationStart)
+        {
+            EmitDriveDebug("settling_start", 0f, 0f, false, 0, 0, 0f, 0f, 0f);
+            return;
+        }
 
         Part core = FindCorePart();
-        if (core == null) return;
+        if (core == null)
+        {
+            EmitDriveDebug("no_core", 0f, 0f, false, 0, 0, 0f, 0f, 0f);
+            return;
+        }
 
         Rigidbody coreRb = core.GetRigidbody();
-        if (coreRb == null) return;
-        if (coreRb.isKinematic) return;
+        if (coreRb == null)
+        {
+            EmitDriveDebug("no_core_rb", 0f, 0f, false, 0, 0, 0f, 0f, 0f);
+            return;
+        }
+        if (coreRb.isKinematic)
+        {
+            EmitDriveDebug("core_kinematic", 0f, 0f, false, 0, 0, 0f, 0f, 0f);
+            return;
+        }
 
         float throttle = 0f;
         if (Keyboard.current[_throttleForwardKey].isPressed) throttle += 1f;
         if (Keyboard.current[_throttleReverseKey].isPressed) throttle -= 1f;
+        if (Mathf.Abs(throttle) < _throttleDeadZone)
+            throttle = 0f;
 
         float steer = 0f;
         if (Keyboard.current[_steerRightKey].isPressed) steer += 1f;
@@ -504,7 +551,10 @@ public sealed class BuildManager : MonoBehaviour
         }
 
         if (_wheelPartsBuffer.Count == 0 && _fallbackWheelCollidersBuffer.Count == 0)
+        {
+            EmitDriveDebug("no_wheels", throttle, steer, braking, motorCount, 0, 0f, coreRb.linearVelocity.magnitude, coreRb.angularVelocity.magnitude);
             return;
+        }
 
         int drivenWheelCount = 0;
         for (int i = 0; i < _wheelPartsBuffer.Count; i++)
@@ -523,7 +573,20 @@ public sealed class BuildManager : MonoBehaviour
         float motorTorquePerDrivenWheel = (drivenWheelCount > 0)
             ? totalMotorTorque / drivenWheelCount
             : 0f;
-        float brakeTorque = braking ? _brakeTorque : 0f;
+        float brakeTorque = braking
+            ? _brakeTorque
+            : (Mathf.Approximately(throttle, 0f) ? _idleBrakeTorque : 0f);
+        EmitDriveDebug(
+            "drive",
+            throttle,
+            steer,
+            braking,
+            motorCount,
+            drivenWheelCount,
+            motorTorquePerDrivenWheel,
+            coreRb.linearVelocity.magnitude,
+            coreRb.angularVelocity.magnitude
+        );
 
         if (_wheelPartsBuffer.Count > 0)
         {
@@ -552,6 +615,78 @@ public sealed class BuildManager : MonoBehaviour
         {
             float steerTorque = steer * _fallbackSteerTorquePerWheel * _fallbackWheelCollidersBuffer.Count;
             coreRb.AddTorque(Vector3.up * steerTorque, ForceMode.Force);
+        }
+    }
+
+    private void EmitDriveDebug(
+        string state,
+        float throttle,
+        float steer,
+        bool braking,
+        int motorCount,
+        int drivenWheelCount,
+        float motorTorquePerWheel,
+        float coreSpeed,
+        float coreAngularSpeed)
+    {
+        if (!_enableDriveDebugLogs)
+            return;
+        if (Time.time < _nextDriveDebugLogTime)
+            return;
+
+        _nextDriveDebugLogTime = Time.time + Mathf.Max(0.05f, _driveDebugLogInterval);
+        Debug.Log(
+            $"[DriveDebug] state={state} th={throttle:F1} st={steer:F1} br={(braking ? 1 : 0)} " +
+            $"motors={motorCount} drivenWheels={drivenWheelCount} torquePerWheel={motorTorquePerWheel:F1} " +
+            $"wheelParts={_wheelPartsBuffer.Count} fallbackWheels={_fallbackWheelCollidersBuffer.Count} " +
+            $"coreSpeed={coreSpeed:F2} coreAng={coreAngularSpeed:F2}",
+            this
+        );
+    }
+
+    private IEnumerator SettleSimulationStart()
+    {
+        _isSettlingSimulationStart = true;
+        float settleTime = Mathf.Max(0f, _simulationStartSettleTime);
+
+        if (settleTime <= 0f)
+        {
+            ClampAssemblyVelocities();
+            _isSettlingSimulationStart = false;
+            _simulationSettleRoutine = null;
+            yield break;
+        }
+
+        float elapsed = 0f;
+        while (elapsed < settleTime)
+        {
+            ClampAssemblyVelocities();
+            elapsed += Time.fixedDeltaTime;
+            yield return new WaitForFixedUpdate();
+        }
+
+        _isSettlingSimulationStart = false;
+        _simulationSettleRoutine = null;
+    }
+
+    private void ClampAssemblyVelocities()
+    {
+        Part[] parts = FindObjectsByType<Part>(FindObjectsSortMode.None);
+        float maxSpeed = Mathf.Max(0f, _simulationStartMaxSpeed);
+        float maxAngular = Mathf.Max(0f, _simulationStartMaxAngularSpeed);
+
+        for (int i = 0; i < parts.Length; i++)
+        {
+            Part part = parts[i];
+            if (part == null) continue;
+
+            Rigidbody rb = part.GetRigidbody();
+            if (rb == null || rb.isKinematic) continue;
+
+            if (maxSpeed > 0f && rb.linearVelocity.sqrMagnitude > maxSpeed * maxSpeed)
+                rb.linearVelocity = rb.linearVelocity.normalized * maxSpeed;
+            if (maxAngular > 0f && rb.angularVelocity.sqrMagnitude > maxAngular * maxAngular)
+                rb.angularVelocity = rb.angularVelocity.normalized * maxAngular;
         }
     }
 
