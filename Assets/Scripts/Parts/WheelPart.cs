@@ -17,6 +17,11 @@ public sealed class WheelPart : MonoBehaviour
     [SerializeField, Min(0f)] private float _maxMotorTorque = 1000f;
     [SerializeField, Min(0f)] private float _maxBrakeTorque = 2500f;
     [SerializeField, Min(0.01f)] private float _motorTorqueResponsePerSecond = 6000f;
+    [SerializeField, Min(0.01f)] private float _brakeTorqueResponsePerSecond = 8000f;
+    [SerializeField] private bool _enableAbsBrakeModulation = true;
+    [SerializeField, Min(0f)] private float _absForwardSlipThreshold = 0.55f;
+    [SerializeField, Range(0f, 1f)] private float _absBrakeReleaseMultiplier = 0.35f;
+    [SerializeField, Range(0f, 1f)] private float _airborneBrakeMultiplier = 0.2f;
     [SerializeField] private bool _autoCaptureVisualOffsetOnPlay = true;
     [SerializeField] private Vector3 _visualEulerOffset;
 
@@ -56,6 +61,7 @@ public sealed class WheelPart : MonoBehaviour
     public bool IsReady => _wheelCollider != null;
     private BuildManager _buildManager;
     private float _appliedMotorTorque;
+    private float _appliedBrakeTorque;
     private bool _hasNonUniformVisualScale;
     private float _nextDebugLogTime;
     private int _wheelDebugId;
@@ -90,6 +96,10 @@ public sealed class WheelPart : MonoBehaviour
         _maxMotorTorque = Mathf.Max(0f, _maxMotorTorque);
         _maxBrakeTorque = Mathf.Max(0f, _maxBrakeTorque);
         _motorTorqueResponsePerSecond = Mathf.Max(0.01f, _motorTorqueResponsePerSecond);
+        _brakeTorqueResponsePerSecond = Mathf.Max(0.01f, _brakeTorqueResponsePerSecond);
+        _absForwardSlipThreshold = Mathf.Max(0f, _absForwardSlipThreshold);
+        _absBrakeReleaseMultiplier = Mathf.Clamp01(_absBrakeReleaseMultiplier);
+        _airborneBrakeMultiplier = Mathf.Clamp01(_airborneBrakeMultiplier);
         _buildArrowLength = Mathf.Max(0.05f, _buildArrowLength);
         _autoFitRadiusMultiplier = Mathf.Max(0.1f, _autoFitRadiusMultiplier);
         _autoFitMinRadius = Mathf.Max(0.01f, _autoFitMinRadius);
@@ -127,33 +137,43 @@ public sealed class WheelPart : MonoBehaviour
         float steerAngle = _isSteerable ? Mathf.Clamp(signedSteer, -1f, 1f) * _maxSteerAngle : 0f;
         _wheelCollider.steerAngle = steerAngle;
 
-        float clampedBrakeTorque = Mathf.Clamp(brakeTorque, 0f, _maxBrakeTorque);
-        _wheelCollider.brakeTorque = clampedBrakeTorque;
+        float targetBrakeTorque = Mathf.Clamp(brakeTorque, 0f, _maxBrakeTorque);
 
         float signedMotor = _invertDriveDirection ? -motorTorque : motorTorque;
         float targetMotorTorque = Mathf.Clamp(signedMotor, -_maxMotorTorque, _maxMotorTorque);
         if (!_isDriven)
             targetMotorTorque = 0f;
 
-        // Slip-aware traction: cut drive torque when the wheel is already slipping.
-        if (_wheelCollider.GetGroundHit(out WheelHit hit))
+        bool grounded = _wheelCollider.GetGroundHit(out WheelHit hit);
+
+        // Slip/load-aware traction and braking: prevent single-wheel lockup hop under braking.
+        if (grounded)
         {
             bool excessiveSlip = Mathf.Abs(hit.forwardSlip) > _maxForwardSlipBeforeTorqueCut
                 && Mathf.Abs(hit.sidewaysSlip) > _maxSideSlipBeforeTorqueCut;
             if (excessiveSlip)
                 targetMotorTorque *= _slipTorqueMultiplier;
+
+            // Simple ABS: release some brake when lockup slip appears.
+            if (_enableAbsBrakeModulation && Mathf.Abs(hit.forwardSlip) > _absForwardSlipThreshold)
+                targetBrakeTorque *= _absBrakeReleaseMultiplier;
+
         }
         else
         {
             targetMotorTorque *= _airborneTorqueMultiplier;
+            targetBrakeTorque *= _airborneBrakeMultiplier;
         }
 
         // Smooth torque application to avoid frame-to-frame impulses that can cause hopping.
         float response = Mathf.Max(0.01f, _motorTorqueResponsePerSecond) * Time.deltaTime;
         _appliedMotorTorque = Mathf.MoveTowards(_appliedMotorTorque, targetMotorTorque, response);
         _wheelCollider.motorTorque = _appliedMotorTorque;
+        float brakeResponse = Mathf.Max(0.01f, _brakeTorqueResponsePerSecond) * Time.deltaTime;
+        _appliedBrakeTorque = Mathf.MoveTowards(_appliedBrakeTorque, targetBrakeTorque, brakeResponse);
+        _wheelCollider.brakeTorque = _appliedBrakeTorque;
 
-        EmitRuntimeWheelDebug(targetMotorTorque, clampedBrakeTorque, steerAngle);
+        EmitRuntimeWheelDebug(targetMotorTorque, _appliedBrakeTorque, steerAngle);
     }
 
     public void ClearDrive()
@@ -162,6 +182,7 @@ public sealed class WheelPart : MonoBehaviour
             return;
 
         _appliedMotorTorque = 0f;
+        _appliedBrakeTorque = 0f;
         _wheelCollider.motorTorque = 0f;
         _wheelCollider.steerAngle = 0f;
         _wheelCollider.brakeTorque = 0f;

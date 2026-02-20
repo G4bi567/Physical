@@ -81,7 +81,7 @@ Transform:
   m_GameObject: {fileID: 4819979865673199329}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: -3.41245, y: 0.99999994, z: -0.26971}
+  m_LocalPosition: {x: -0.20568, y: 0, z: -6.35732}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children:
@@ -146,14 +146,14 @@ WheelCollider:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 4819979865673199329}
   serializedVersion: 2
-  m_Center: {x: 0, y: 0.000000029802322, z: -0.000000074505806}
-  m_Radius: 0.45000008
+  m_Center: {x: 0, y: 0.00000008940697, z: 0}
+  m_Radius: 1
   m_SuspensionSpring:
     spring: 28000
     damper: 4200
     targetPosition: 0.5
   m_SuspensionDistance: 0.02
-  m_ForceAppPointDistance: 0.11250002
+  m_ForceAppPointDistance: 0.11250003
   m_Mass: 22
   m_WheelDampingRate: 1
   m_ForwardFriction:
@@ -201,8 +201,8 @@ MonoBehaviour:
   _motorTorqueResponsePerSecond: 6000
   _autoCaptureVisualOffsetOnPlay: 1
   _visualEulerOffset: {x: 0, y: 0, z: 0}
-  _autoTuneWheelCollider: 1
-  _autoFitColliderToVisual: 1
+  _autoTuneWheelCollider: 0
+  _autoFitColliderToVisual: 0
   _warnOnNonUniformParentScale: 0
   _disableExtraVisualColliders: 1
   _autoFitRadiusMultiplier: 1
@@ -238,7 +238,6 @@ GameObject:
   - component: {fileID: 3050988241295999908}
   - component: {fileID: 3847376618450708939}
   - component: {fileID: 7201137584638619904}
-  - component: {fileID: 5721994668181264450}
   m_Layer: 6
   m_Name: Cylinder
   m_TagString: Untagged
@@ -318,29 +317,6 @@ MeshRenderer:
   m_SortingOrder: 0
   m_MaskInteraction: 0
   m_AdditionalVertexStreams: {fileID: 0}
---- !u!136 &5721994668181264450
-CapsuleCollider:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 5723878508837847113}
-  m_Material: {fileID: 0}
-  m_IncludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_ExcludeLayers:
-    serializedVersion: 2
-    m_Bits: 0
-  m_LayerOverridePriority: 0
-  m_IsTrigger: 0
-  m_ProvidesContacts: 0
-  m_Enabled: 0
-  serializedVersion: 2
-  m_Radius: 0.5000001
-  m_Height: 2
-  m_Direction: 1
-  m_Center: {x: 0.000000059604645, y: 0, z: -0.00000008940697}
 --- !u!1 &8214714688389591265
 GameObject:
   m_ObjectHideFlags: 0

@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEngine.InputSystem;
 using UnityEngine.Serialization;
+using System.Collections.Generic;
 
 public class PlacementPreview : MonoBehaviour
 {
@@ -267,6 +268,8 @@ public class PlacementPreview : MonoBehaviour
             _mirrorPreviewPart != null ? _mirrorPreviewPart.transform : null,
             primarySnapTargetRoot
         );
+        if (!_isPlacementValid && IsWheelNodeSnapValid(_currentPreviewPart, _lastSnap))
+            _isPlacementValid = true;
         ApplyPreviewTint(_isPlacementValid ? _validPreviewColor : _invalidPreviewColor);
         UpdateMirrorPreviewFromPrimary();
         UpdateSnapIndicator();
@@ -381,6 +384,8 @@ public class PlacementPreview : MonoBehaviour
 
         Transform mirrorSnapTargetRoot = GetSnapTargetRoot(_lastMirrorSnap);
         _isMirrorPlacementValid = CheckPlacementValid(_mirrorPreviewPart, null, mirrorSnapTargetRoot);
+        if (!_isMirrorPlacementValid && IsWheelNodeSnapValid(_mirrorPreviewPart, _lastMirrorSnap))
+            _isMirrorPlacementValid = true;
         if (_requireMirrorSnapConnection && !_lastMirrorSnap.IsValid)
             _isMirrorPlacementValid = false;
 
@@ -588,6 +593,15 @@ public class PlacementPreview : MonoBehaviour
         return snap.TargetNode.Owner.transform;
     }
 
+    private static bool IsWheelNodeSnapValid(Part previewPart, SnapSystem.SnapResult snap)
+    {
+        if (previewPart == null) return false;
+        if (previewPart.PartType != PartType.Wheel) return false;
+        if (!snap.IsValid) return false;
+        if (snap.PreviewNode == null || snap.TargetNode == null) return false;
+        return true;
+    }
+
     private void ConfigurePlacedJoint(
         FixedJoint joint,
         Rigidbody previewRb,
@@ -627,6 +641,7 @@ public class PlacementPreview : MonoBehaviour
         joint.connectedBody = targetRb;
         ConfigurePlacedJoint(joint, previewRb, targetRb, previewNode, targetNode);
         previewNode.MarkConnected(targetNode);
+        IgnorePartPairCollisions(previewNode.Owner, targetNode.Owner);
         return true;
     }
 
@@ -741,6 +756,7 @@ public class PlacementPreview : MonoBehaviour
             TryCreateNodeJoint(primarySnap.PreviewNode, primarySnap.TargetNode);
 
         TryCreateSecondaryLoopJoints(placedPart);
+        IgnoreInternalCollisionsForPlacedPart(placedPart);
 
         PartPlaced?.Invoke(placedPart);
 
@@ -753,6 +769,7 @@ public class PlacementPreview : MonoBehaviour
                 TryCreateNodeJoint(mirroredSnap.PreviewNode, mirroredSnap.TargetNode);
 
             TryCreateSecondaryLoopJoints(mirroredPlacedPart);
+            IgnoreInternalCollisionsForPlacedPart(mirroredPlacedPart);
 
             PartPlaced?.Invoke(mirroredPlacedPart);
         }
@@ -789,6 +806,64 @@ public class PlacementPreview : MonoBehaviour
             mirroredUp = Vector3.up;
 
         return Quaternion.LookRotation(mirroredForward.normalized, mirroredUp.normalized);
+    }
+
+    private static void IgnoreInternalCollisionsForPlacedPart(Part placedPart)
+    {
+        if (placedPart == null)
+            return;
+
+        HashSet<Part> visited = new HashSet<Part>();
+        Queue<Part> queue = new Queue<Part>();
+        visited.Add(placedPart);
+        queue.Enqueue(placedPart);
+
+        while (queue.Count > 0)
+        {
+            Part current = queue.Dequeue();
+            var nodes = current != null ? current.GetNodes() : null;
+            if (nodes == null)
+                continue;
+
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                ConnectionNode node = nodes[i];
+                if (node == null || node.ConnectedTo == null || node.ConnectedTo.Owner == null)
+                    continue;
+
+                Part other = node.ConnectedTo.Owner;
+                if (other == null || other == current)
+                    continue;
+
+                IgnorePartPairCollisions(placedPart, other);
+                if (visited.Add(other))
+                    queue.Enqueue(other);
+            }
+        }
+    }
+
+    private static void IgnorePartPairCollisions(Part partA, Part partB)
+    {
+        if (partA == null || partB == null || partA == partB)
+            return;
+
+        Collider[] aColliders = partA.GetComponentsInChildren<Collider>(includeInactive: true);
+        Collider[] bColliders = partB.GetComponentsInChildren<Collider>(includeInactive: true);
+        if (aColliders == null || bColliders == null || aColliders.Length == 0 || bColliders.Length == 0)
+            return;
+
+        for (int i = 0; i < aColliders.Length; i++)
+        {
+            Collider a = aColliders[i];
+            if (a == null) continue;
+
+            for (int j = 0; j < bColliders.Length; j++)
+            {
+                Collider b = bColliders[j];
+                if (b == null) continue;
+                Physics.IgnoreCollision(a, b, true);
+            }
+        }
     }
 
     // Optional: quick debug so you can see validity while playing.
